@@ -1,0 +1,215 @@
+{
+  "files": [
+    {
+      "executable": false,
+      "path": ".gitignore",
+      "sha256": "c5ab4053ec8ca6b413bb1ec5b5581b493e04434088a59f26c8d06a298fa89189"
+    },
+    {
+      "executable": false,
+      "path": "LICENSE",
+      "sha256": "159f6ea1c9b1beb8d9912d937857b7f8b8032af1f71cdb4a07bbd96a201e43af"
+    },
+    {
+      "executable": false,
+      "path": "NOTICE",
+      "sha256": "245ec460d48ab3060d6f3d727091e4d3c90a39e1072b2d494b59d43e6adecf9d"
+    },
+    {
+      "executable": false,
+      "path": "README.md",
+      "sha256": "a68071e85314dd34104a4d77066ef945fb6002e6dbd443f779287c7cc13ee567"
+    },
+    {
+      "executable": false,
+      "path": "SPECIFICATION.md",
+      "sha256": "a7354b7c3ce7914f98c755ed200f63746787942c671144c1d2db954f9f6acf21"
+    },
+    {
+      "executable": false,
+      "path": "ora_review/__init__.py",
+      "sha256": "70326f00d668e7aa68654d3e4012cc528cba65e496945ee569e2a020a3bed94f"
+    },
+    {
+      "executable": false,
+      "path": "ora_review/adapters.py",
+      "sha256": "43deb1fed1e46559d81529754835e7ea62d3e2ef9ba7c6411bdac82d1f5aab59"
+    },
+    {
+      "executable": false,
+      "path": "ora_review/cli.py",
+      "sha256": "a5c690d1f978cf0499039f9deac87181a99e667067e8032b79b0a5626627474f"
+    },
+    {
+      "executable": false,
+      "path": "ora_review/errors.py",
+      "sha256": "ff6d3c3828943d5fbd6902f2538b43b594fba583a9d73cdacf5eb50a204fada5"
+    },
+    {
+      "executable": false,
+      "path": "ora_review/instructions/breadth-analytical.md",
+      "sha256": "a7129f43601e68e96a77a467e130fcb9b8f9fbe5972106a927bd88773823ee66"
+    },
+    {
+      "executable": false,
+      "path": "ora_review/instructions/breadth-committed.md",
+      "sha256": "b40df7bbac3a198f4417781c103513db5515f1517f6bb77fe183c6260bccb069"
+    },
+    {
+      "executable": false,
+      "path": "ora_review/instructions/consolidator.md",
+      "sha256": "938756ebf285700b6bff0b2f5a9fda7f5e38bed811ce756c29aa864110d879cb"
+    },
+    {
+      "executable": false,
+      "path": "ora_review/instructions/depth.md",
+      "sha256": "c4fef03ca127ce5a5734ed1728c3044861ea6ec0b96f7cf718b729d358e8bc9c"
+    },
+    {
+      "executable": false,
+      "path": "ora_review/instructions/initial-answer.md",
+      "sha256": "558d8a1c8ead5adec6d276d3575d122749a4429cc25c35b6954ba8954355f840"
+    },
+    {
+      "executable": false,
+      "path": "ora_review/instructions/output-answer.md",
+      "sha256": "0c5664438e8001c84894a45cd622ffd55e6f8ba24b70ccc78fdd87caff8c0491"
+    },
+    {
+      "executable": false,
+      "path": "ora_review/instructions/output-review.md",
+      "sha256": "b9d3e04ff59a4cb51e48be4d57fb1da426733acc4191d4b1a820f304ca365020"
+    },
+    {
+      "executable": false,
+      "path": "ora_review/instructions/output-revision.md",
+      "sha256": "48b9044ff149839ac2cc078b1380517773e71ed2fe0e73955d8f2081a606bad6"
+    },
+    {
+      "executable": false,
+      "path": "ora_review/instructions/output-validator.md",
+      "sha256": "2f23b5504c81b68d8aab94d39647c4b320b71b18be301e93be3f4c1cbb7df518"
+    },
+    {
+      "executable": false,
+      "path": "ora_review/instructions/review-breadth.md",
+      "sha256": "daa4ad4529d7eb287d9234c61ba9a7b951b58afda17875a99a2cba62d92d5231"
+    },
+    {
+      "executable": false,
+      "path": "ora_review/instructions/review-consolidated.md",
+      "sha256": "f4223312d0b34702aa5bafbab56feda80627c7fd9e4706f7f2dbf39180ecae83"
+    },
+    {
+      "executable": false,
+      "path": "ora_review/instructions/review-depth.md",
+      "sha256": "0f6c7df47ac48395866e78caa95ee36cd9d90e2562640a00d2dd8f20f23b0546"
+    },
+    {
+      "executable": false,
+      "path": "ora_review/instructions/reviewer.md",
+      "sha256": "778894147c56d37752e181d9de79a7fbb344840a11fb151012a6420f93d92aaa"
+    },
+    {
+      "executable": false,
+      "path": "ora_review/instructions/revise-breadth.md",
+      "sha256": "31234ad65ac170485ee9e4443662d647c30d4f5c09a88d3ff8edaa0dfb0e8aee"
+    },
+    {
+      "executable": false,
+      "path": "ora_review/instructions/revise-consolidated.md",
+      "sha256": "ddcffe3697447ba158958c136701466a2df09e898a4bb03ca59124dca7bfc94e"
+    },
+    {
+      "executable": false,
+      "path": "ora_review/instructions/revise-depth.md",
+      "sha256": "cb08310a21876190540716d3bb768b0a5f86530b0dbd5d6fd14a2de4b97d2a52"
+    },
+    {
+      "executable": false,
+      "path": "ora_review/instructions/reviser.md",
+      "sha256": "cf2b74fc24a82be10e2429f396b0ccace96085ee8fcd3c700d2ae5597d795ed9"
+    },
+    {
+      "executable": false,
+      "path": "ora_review/instructions/universal.md",
+      "sha256": "bac355e8e9989150f4636992ff14f7e2346e2be9fcd655836c0295ad95f9fad2"
+    },
+    {
+      "executable": false,
+      "path": "ora_review/instructions/validator.md",
+      "sha256": "03700016e0274e13583b1a8850ef9ec3cb0ab4268d6afe994054e8295abab9ed"
+    },
+    {
+      "executable": false,
+      "path": "ora_review/models.py",
+      "sha256": "0785fc67c86fc1a9a4c8f684450858435402e5d3f813efdef1b9d3f4be11d6aa"
+    },
+    {
+      "executable": false,
+      "path": "ora_review/packet.py",
+      "sha256": "49e35e1f546852c2d386a936519bc8875bb61a8e46d18c94201ab39101fb5470"
+    },
+    {
+      "executable": false,
+      "path": "ora_review/record.py",
+      "sha256": "740124c93fdf4afb14fbf369f962ce02e926d54a444c5263852626dfcde64777"
+    },
+    {
+      "executable": false,
+      "path": "ora_review/runner.py",
+      "sha256": "8f4a8224cc0c5ae78491902605d287259cfab0e4aeb2c6d5229a6727dc476b41"
+    },
+    {
+      "executable": false,
+      "path": "ora_review/validator.py",
+      "sha256": "d8a04d89c900dbc5e46f05d7509c765d7e2e3e217e613ef430770fc89b4e3f30"
+    },
+    {
+      "executable": false,
+      "path": "packages/claude/ora-gear-3/SKILL.md",
+      "sha256": "fa09fa381f11995b56aaa21eccc4c5c04bc35b05a7650ac274d48d28da8791a1"
+    },
+    {
+      "executable": false,
+      "path": "packages/claude/ora-gear-4/SKILL.md",
+      "sha256": "a38e0559208c082461c2506eadb404455982b1df451d4c6ba913cd92606a57c3"
+    },
+    {
+      "executable": false,
+      "path": "packages/codex/ora-gear-3/SKILL.md",
+      "sha256": "4970c2c78e2743e7286869a13e3d4ac27e6de3b6c60522509a1a30f0077a0688"
+    },
+    {
+      "executable": false,
+      "path": "packages/codex/ora-gear-4/SKILL.md",
+      "sha256": "b893dd653cecbb3d0725bff00f449bd4e67105ba47185226fba7ede91b004338"
+    },
+    {
+      "executable": false,
+      "path": "pyproject.toml",
+      "sha256": "1b6dd345cb07b3f549c4be93f118c589febe652459b90d2bb3fbcf5ba9046f30"
+    },
+    {
+      "executable": false,
+      "path": "tests/__init__.py",
+      "sha256": "b1fbe32f0e787088bfc72e9f9a45d7e9b8ab53bd1461ac2c9962a7d5228d4686"
+    },
+    {
+      "executable": false,
+      "path": "tests/fixtures/validator-prose-envelope-response.md",
+      "sha256": "763205387da02845103b5d512faec5765a8f7b9384797a00b422b4b53fa8d29f"
+    },
+    {
+      "executable": false,
+      "path": "tests/qualify_codex_initiator.py",
+      "sha256": "df99eee18b532a0d9bc3cd8610ab5510b05f105e0310fdb885982bb6591e342d"
+    },
+    {
+      "executable": false,
+      "path": "tests/test_acceptance.py",
+      "sha256": "c132f59913a32a59c2a53506f6dd2aae0f707af6ad271c94657ad21e10e36462"
+    }
+  ],
+  "version": 1
+}

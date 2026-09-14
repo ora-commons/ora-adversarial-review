@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ora-adversarial-review"
+version = "0.1.0"
+description = "Standalone Gear 3 and Gear 4 review with Codex or Claude, plus external validation"
+readme = "README.md"
+license = { file = "LICENSE" }
+requires-python = ">=3.10"
+classifiers = [
+    "License :: CC0 1.0 Universal (CC0 1.0) Public Domain Dedication",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+]
+
+[project.scripts]
+ora-gear-3 = "ora_review.cli:main_gear3"
+ora-gear-4 = "ora_review.cli:main_gear4"
+ora-validator = "ora_review.cli:main_validator"
+
+[tool.setuptools]
+packages = ["ora_review"]
+license-files = ["LICENSE", "NOTICE"]
+[tool.setuptools.package-data]
+ora_review = ["instructions/*.md"]
