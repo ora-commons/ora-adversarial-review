@@ -18,12 +18,12 @@
     {
       "executable": false,
       "path": "README.md",
-      "sha256": "a68071e85314dd34104a4d77066ef945fb6002e6dbd443f779287c7cc13ee567"
+      "sha256": "6ea577caf9e7a9e0957e73542b3ddb9af7656a3059e0037485165c260d75e690"
     },
     {
       "executable": false,
       "path": "SPECIFICATION.md",
-      "sha256": "a7354b7c3ce7914f98c755ed200f63746787942c671144c1d2db954f9f6acf21"
+      "sha256": "0b9aa9d33a50e1ad0877243e3688f86b33237928d7868fe4d78dcf275d465e2b"
     },
     {
       "executable": false,
@@ -188,7 +188,7 @@
     {
       "executable": false,
       "path": "pyproject.toml",
-      "sha256": "1b6dd345cb07b3f549c4be93f118c589febe652459b90d2bb3fbcf5ba9046f30"
+      "sha256": "214c023e23daf4e86876dcd55fc294881be6a190af5efcbb6b9286655b1449e4"
     },
     {
       "executable": false,

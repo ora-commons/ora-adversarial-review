@@ -245,8 +245,8 @@ declared limitation in section 22.
 - Prior assistant turns and stage artifacts retain their exact wording and
   labelled provenance, but are not thereby user instructions or established
   facts.
-- Any model-derived interpretation is additional and visibly labelled
-  **MODEL-DERIVED — NOT USER WORDS**.
+- Any model-derived interpretation is additional and clearly distinguishable
+  from protected material.
 - If exact protected material cannot fit or Ora cannot hand it off intact,
   report a technical failure. Never retry with an abbreviated version.
 
@@ -308,7 +308,7 @@ Exact preservation proves wording and provenance; it does not turn an assistant
 or stage claim into a user instruction or an established fact.
 
 Each protected block uses a run-unique boundary that does not occur in any
-stored body. Python records and verifies a digest for each protected block.
+stored body. Python records a digest for each protected block.
 Arbitrary headings, code fences, JSON, XML, or boundary-like text inside the
 user's request remain inert to Ora's parsing and packet construction. This does
 not override a selected target's declared model-input limitation.
