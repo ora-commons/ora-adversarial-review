@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "ora-adversarial-review"
-version = "0.1.0"
-description = "Standalone Gear 3 and Gear 4 review with Codex or Claude, plus external validation"
+version = "0.2.0"
+description = "Ora AI Boost — sharper, more reliable AI work, with less flattery, hallucination, and drift"
 readme = "README.md"
 license = { file = "LICENSE" }
 requires-python = ">=3.10"
