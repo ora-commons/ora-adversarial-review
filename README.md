@@ -35,7 +35,7 @@ You need Python 3.10 or later and `git`. Clone the public repository at the rele
 and install into a virtual environment. In a POSIX shell:
 
 ```sh
-git clone --branch v0.2.0 https://github.com/ora-commons/ora-adversarial-review.git
+git clone --branch v0.3.0 https://github.com/ora-commons/ora-adversarial-review.git
 cd ora-adversarial-review
 python3 -m venv .venv
 . .venv/bin/activate
@@ -117,7 +117,8 @@ older releases stay reachable.
 
 ## Prerequisites: the AI engine
 
-Gear 3 and Gear 4 need one supported, authenticated native command on `PATH`:
+Gear 3 and Gear 4 name their native engine with `--native`; all six tools are
+selectable for the primary analytical role:
 
 - `codex` is the compatible default. Gear starts a fresh ephemeral read-only
   `codex exec` call for every native role. This route does not select or report an
@@ -126,6 +127,19 @@ Gear 3 and Gear 4 need one supported, authenticated native command on `PATH`:
   its ordinary subscription route; Agent Bridge is not involved in native roles. Each
   call is fresh, non-persistent, restricted to no model tools, and run in a temporary
   neutral directory.
+- `zcode`, `hermes`, `qwen`, and `minimax` are selected with `--native TARGET`. Gear
+  runs every native role as a fresh text-only analytical call to that exact target
+  through the Agent Bridge review transport. These are analytical roles only: Gear
+  claims and implements no project-editing work mode for them. Hermes and Qwen have
+  no project-editing work mode in Bridge, and Gear does not invent one.
+
+An unavailable selected engine is reported with its readiness failure and the
+selectable alternatives; Gear never silently substitutes Codex, Claude, or another
+vendor for the participant you chose.
+
+No analytical call — native or peer — has an elapsed-time cutoff. Work ends on
+completion, explicit cancellation, or a real terminal error; only readiness
+checks and cleanup stay bounded.
 
 The validator has no native role at all: it is external-only and always requires a
 peer. `--model` is valid only with `--native claude` and pins either accepted Fable
@@ -183,7 +197,12 @@ readiness, transport, shape, root-set, or provenance failure, and certifies only
 one bounded decision body.
 
 External operation requires the frozen Bridge Format 2 checkout at `AGENT_BRIDGE_HOME`
-or `~/agent-bridge`, and a signed-in tool for the peer you name. Gear invokes
+or `~/agent-bridge`, and a signed-in tool for the peer you name. When
+`AGENT_BRIDGE_HOME` is set, that exact copy is used: an invalid selected path fails
+naming that path, and never falls back to another installation such as
+`~/agent-bridge`. With no selection, the documented standalone default
+`~/agent-bridge` is used. Every run reports the Bridge copy actually used, by path
+and version, beside the readiness line. Gear invokes
 `-m bridge` through its own Python, omits `Project:`, and has no Format 1 path.
 
 Gear surfaces all Bridge readiness and limitation warnings outside the answer, and
@@ -207,10 +226,10 @@ exact peer decisions. Runs are recorded under
 
 Optional thin host entries are under `packages/codex/` and `packages/claude/`; they
 invoke the installed commands without copying the method or runner. Claude entries
-always select `--native claude`; Codex entries preserve the default unless the caller
-deliberately selects Claude. A host installer may place the chosen entry in its normal
-skill directory; the initiating host remains distinct from the engine named by
-`--native`.
+select `--native claude` by default and Codex entries keep the Codex default; each
+passes the caller's explicit engine choice through unchanged. A host installer may
+place the chosen entry in its normal skill directory; the initiating host remains
+distinct from the engine named by `--native`.
 
 ## Tested scope
 

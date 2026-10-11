@@ -890,14 +890,18 @@ limitation in section 22.
 
 Reference commands:
 
-    ora-gear-3 [--native codex|claude] [--model fable|claude-fable-5]
-               [--peer <target>] [--consensus]
-    ora-gear-4 [--native codex|claude] [--model fable|claude-fable-5]
-               [--peer <target>] [--consensus]
+    ora-gear-3 [--native codex|claude|zcode|hermes|qwen|minimax]
+               [--model fable|claude-fable-5] [--peer <target>] [--consensus]
+    ora-gear-4 [--native codex|claude|zcode|hermes|qwen|minimax]
+               [--model fable|claude-fable-5] [--peer <target>] [--consensus]
                [--breadth analytical|committed]
 
 Codex is the compatible native default. `--native claude` selects Claude Code;
-`--model` is accepted only with that engine and pins either the `fable` alias or
+`--native zcode`, `--native hermes`, `--native qwen`, and `--native minimax`
+serve every native role as fresh analytical text exchanges through Agent
+Bridge, without project-editing work mode; an unavailable selected engine is
+reported with the alternatives, never silently substituted. `--model` is
+accepted only with the Claude engine and pins either the `fable` alias or
 the full `claude-fable-5` selector. Omitting Claude's model selector permits the
 official CLI's configured model, but Ora still requires and records one
 unambiguous effective-model attribution for each successful role. Omitting
@@ -1286,7 +1290,7 @@ The required Bridge contract is:
   context;
 - Bridge records the exact supplied body; target model-input behavior is
   declared separately;
-- a run has a deadline and no courier retry;
+- a run carries no elapsed-time deadline and no courier retry;
 - the application owns every Gear stage, counter, verdict, fallback, and status;
 - Bridge selects neither model nor effort and reports neither unless its own
   future contract changes truthfully.

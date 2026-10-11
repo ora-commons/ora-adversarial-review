@@ -16,7 +16,14 @@ from pathlib import Path
 from unittest.mock import patch
 
 import ora_review.cli as cli_module
-from ora_review.adapters import BridgeAdapter, ClaudeAdapter, _ProcessResult
+from ora_review import ANALYTICAL_ENGINES, COMPONENT_FACTS, VERSION
+from ora_review import adapters as adapters_module
+from ora_review.adapters import (
+    BridgeAdapter,
+    ClaudeAdapter,
+    _BridgeCommand,
+    _ProcessResult,
+)
 from ora_review.errors import CallFailure, MalformedResponse, OraReviewError
 from ora_review.models import AnswerBoundary, StageMaterial, UserMaterial
 from ora_review.packet import PacketBuilder, extract_answer, sha256_text
@@ -76,17 +83,19 @@ class ScriptedAdapter:
 class FakeBridgeCommand:
     def __init__(
         self, session: Path, *, fail_after_response: bool = False,
-        timeout_after_response: bool = False, verdict: str = "PASS", warnings: str = ""
+        raise_after_response: bool = False, verdict: str = "PASS", warnings: str = ""
     ) -> None:
         self.session = session
         self.fail_after_response = fail_after_response
-        self.timeout_after_response = timeout_after_response
+        self.raise_after_response = raise_after_response
         self.verdict = verdict
         self.warnings = warnings
         self.bodies: list[str] = []
+        self.arguments: list[tuple[str, ...]] = []
 
-    def run(self, arguments, *, body: str = "", timeout: float = 60):
+    def run(self, arguments, *, body: str = "", timeout: float | None = 60):
         self.bodies.append(body)
+        self.arguments.append(tuple(arguments))
         messages = self.session / "messages"
         messages.mkdir(parents=True, exist_ok=True)
         existing = [
@@ -102,9 +111,9 @@ class FakeBridgeCommand:
                 "## Body\n\n" + _review(self.verdict)
             ).encode("utf-8")
         )
-        if self.timeout_after_response:
+        if self.raise_after_response:
             raise CallFailure(
-                "`bridge` did not finish within 930 seconds. "
+                "`bridge` run ended with a transport failure. "
                 "Last error output: published response was not flushed"
             )
         if self.fail_after_response:
@@ -1492,14 +1501,14 @@ class AcceptanceTests(unittest.TestCase):
                 BridgeAdapter.prepare(peer="zcode", initiator="ora-gear-3")
             self.assertIn("Run zcode login", raised.exception.display())
 
-        for verdict, timeout_after_response in (("PASS", False), ("FAIL", False), ("FAIL", True)):
+        for verdict, raise_after_response in (("PASS", False), ("FAIL", False), ("FAIL", True)):
             with self.subTest(
-                verdict=verdict, timeout_after_response=timeout_after_response
+                verdict=verdict, raise_after_response=raise_after_response
             ), tempfile.TemporaryDirectory() as root:
                 session = Path(root) / "session"
                 command = FakeBridgeCommand(
                     session, fail_after_response=True,
-                    timeout_after_response=timeout_after_response, verdict=verdict
+                    raise_after_response=raise_after_response, verdict=verdict
                 )
                 bridge = BridgeAdapter(
                     command, peer="zcode", initiator="ora-gear-3", session_dir=session
@@ -1529,9 +1538,9 @@ class AcceptanceTests(unittest.TestCase):
                 run_text = Path(result.run_path).read_text(encoding="utf-8")
                 self.assertIn(_review(verdict), run_text)
                 self.assertIn("transport failure", run_text)
-                if timeout_after_response:
+                if raise_after_response:
                     detail = (
-                        "`bridge` did not finish within 930 seconds. "
+                        "`bridge` run ended with a transport failure. "
                         "Last error output: published response was not flushed"
                     )
                     self.assertIn(detail, run_text)
@@ -1606,6 +1615,197 @@ class AcceptanceTests(unittest.TestCase):
                             os.killpg(int(call.split("\t")[0]), signal.SIGKILL)
                         except ProcessLookupError:
                             pass
+
+
+class ParticipantAndTransportContractTests(unittest.TestCase):
+    """The six-engine analytical boundary, no-deadline transport, and Bridge binding."""
+
+    def test_analytical_calls_carry_no_elapsed_deadline(self) -> None:
+        self.assertFalse(
+            hasattr(adapters_module, "MODEL_TIMEOUT_SECONDS"),
+            "an elapsed-time model-call cutoff still exists",
+        )
+        with tempfile.TemporaryDirectory() as root:
+            session = Path(root) / "session"
+            command = FakeBridgeCommand(session)
+            bridge = BridgeAdapter(
+                command, peer="zcode", initiator="ora-gear-3", session_dir=session
+            )
+            self.assertEqual(bridge.engine, "zcode")
+            bridge.call("# packet", role="gear-3-review-1")
+            self.assertEqual(command.arguments, [("run", "--session", str(session))])
+
+    def test_selected_bridge_home_is_bound_and_reported(self) -> None:
+        def make_bridge(root: Path, version: str) -> None:
+            package = root / "bridge"
+            package.mkdir(parents=True)
+            (package / "__main__.py").write_text("", encoding="utf-8")
+            (package / "cli.py").write_text("", encoding="utf-8")
+            (package / "__init__.py").write_text(
+                f'VERSION = "{version}"\n', encoding="utf-8"
+            )
+
+        with tempfile.TemporaryDirectory() as root:
+            fixture = Path(root)
+            selected = fixture / "selected-bridge"
+            make_bridge(selected, "9.9.9")
+            home = fixture / "home"
+            home.mkdir()
+            make_bridge(home / "agent-bridge", "1.0.0")
+            without_selection = os.environ.copy()
+            without_selection.pop("AGENT_BRIDGE_HOME", None)
+
+            with (
+                patch.dict(os.environ, {"AGENT_BRIDGE_HOME": str(selected)}),
+                patch.object(Path, "home", return_value=home),
+            ):
+                command = _BridgeCommand.locate()
+            self.assertEqual(command.root, selected.resolve())
+            self.assertEqual(command.version, "9.9.9")
+            self.assertIn(str(selected.resolve()), command.describe())
+            self.assertIn("9.9.9", command.describe())
+
+            with (
+                patch.dict(
+                    os.environ, {"AGENT_BRIDGE_HOME": str(fixture / "missing-bridge")}
+                ),
+                patch.object(Path, "home", return_value=home),
+            ):
+                with self.assertRaises(CallFailure) as raised:
+                    _BridgeCommand.locate()
+            detail = raised.exception.display()
+            self.assertIn("missing-bridge", detail)
+            self.assertIn("No fallback", detail)
+
+            with (
+                patch.dict(os.environ, without_selection, clear=True),
+                patch.object(Path, "home", return_value=home),
+            ):
+                command = _BridgeCommand.locate()
+            self.assertEqual(command.root, (home / "agent-bridge").resolve())
+            self.assertEqual(command.version, "1.0.0")
+
+    def test_bridge_native_engine_preserves_the_selected_participant(self) -> None:
+        with tempfile.TemporaryDirectory() as root:
+            fixture = Path(root)
+            request_path = fixture / "request.md"
+            request_path.write_text("Exact request.", encoding="utf-8")
+            answer_path = fixture / "answer.md"
+            answer_path.write_text("complete answer", encoding="utf-8")
+            selected = ScriptedAdapter(
+                {"gear-3-review-1": [_review("PASS")]}, engine="zcode"
+            )
+            readiness = (
+                "zcode is ready.\nAgent Bridge copy used: /fake/agent-bridge (1.2.0)"
+            )
+            output_bytes = io.BytesIO()
+            stdout = io.TextIOWrapper(output_bytes, encoding="utf-8")
+            stderr = io.StringIO()
+            with (
+                patch.object(
+                    cli_module,
+                    "CodexAdapter",
+                    side_effect=AssertionError("Codex replaced the selected engine"),
+                ),
+                patch.object(
+                    cli_module.BridgeAdapter, "prepare", return_value=(selected, readiness)
+                ),
+                patch.object(
+                    cli_module,
+                    "RunRequest",
+                    side_effect=lambda **kwargs: RunRequest(
+                        run_root=fixture / "runs", **kwargs
+                    ),
+                ),
+                patch.object(cli_module.sys, "stdout", stdout),
+                patch.object(cli_module.sys, "stderr", stderr),
+            ):
+                exit_code = cli_module._run(
+                    "gear3",
+                    [
+                        "--request",
+                        str(request_path),
+                        "--current-answer",
+                        str(answer_path),
+                        "--native",
+                        "zcode",
+                    ],
+                )
+                stdout.flush()
+
+            self.assertEqual(exit_code, 0)
+            self.assertEqual(output_bytes.getvalue(), b"complete answer")
+            status = stderr.getvalue()
+            self.assertIn("native engine `zcode`", status)
+            self.assertIn("Agent Bridge copy used", status)
+            self.assertIn("fresh Agent Bridge calls to `zcode`", status)
+            self.assertIn(
+                "Effective model and effort are not selected or reported.", status
+            )
+            record = next((fixture / "runs").glob("*/RUN.md"))
+            self.assertIn(
+                "Native engine: `zcode`", record.read_text(encoding="utf-8")
+            )
+
+    def test_unavailable_native_engine_is_never_silently_substituted(self) -> None:
+        with tempfile.TemporaryDirectory() as root:
+            fixture = Path(root)
+            request_path = fixture / "request.md"
+            request_path.write_text("Exact request.", encoding="utf-8")
+            output_bytes = io.BytesIO()
+            stdout = io.TextIOWrapper(output_bytes, encoding="utf-8")
+            stderr = io.StringIO()
+
+            def unavailable(**_kwargs):
+                raise CallFailure("ZCode is not signed in.", "Run zcode login.")
+
+            with (
+                patch.object(
+                    cli_module,
+                    "CodexAdapter",
+                    side_effect=AssertionError("Codex replaced the selected engine"),
+                ),
+                patch.object(
+                    cli_module,
+                    "ClaudeAdapter",
+                    side_effect=AssertionError("Claude replaced the selected engine"),
+                ),
+                patch.object(cli_module.BridgeAdapter, "prepare", side_effect=unavailable),
+                patch.object(cli_module.sys, "stdout", stdout),
+                patch.object(cli_module.sys, "stderr", stderr),
+            ):
+                exit_code = cli_module._run(
+                    "gear3", ["--request", str(request_path), "--native", "zcode"]
+                )
+                stdout.flush()
+
+            self.assertEqual(exit_code, 1)
+            self.assertEqual(output_bytes.getvalue(), b"")
+            status = stderr.getvalue()
+            self.assertIn("Selected native engine `zcode` is unavailable", status)
+            self.assertIn("Run zcode login", status)
+            self.assertIn("No other engine was substituted", status)
+            self.assertIn(
+                "Selectable engines: codex, claude, zcode, hermes, qwen, minimax",
+                status,
+            )
+
+    def test_component_facts_name_roles_and_bridge_requirements(self) -> None:
+        self.assertEqual(
+            ANALYTICAL_ENGINES,
+            ("codex", "claude", "zcode", "hermes", "qwen", "minimax"),
+        )
+        self.assertEqual(COMPONENT_FACTS["component"], "ora-adversarial-review")
+        self.assertEqual(COMPONENT_FACTS["version"], VERSION)
+        self.assertEqual(COMPONENT_FACTS["analytical_roles"]["primary"], ANALYTICAL_ENGINES)
+        self.assertEqual(COMPONENT_FACTS["analytical_roles"]["peer"], ANALYTICAL_ENGINES)
+        self.assertEqual(
+            COMPONENT_FACTS["native_adapter_engines"], ("codex", "claude")
+        )
+        self.assertEqual(
+            COMPONENT_FACTS["bridge_transport"],
+            {"format": 2, "actions": ("check", "record", "run")},
+        )
 
 
 if __name__ == "__main__":
