@@ -18,27 +18,27 @@
     {
       "executable": false,
       "path": "README.md",
-      "sha256": "6ea577caf9e7a9e0957e73542b3ddb9af7656a3059e0037485165c260d75e690"
+      "sha256": "00354e842536b7c98a08cee434bc99e46ebff00890431fd6ecdd57112589254d"
     },
     {
       "executable": false,
       "path": "SPECIFICATION.md",
-      "sha256": "0b9aa9d33a50e1ad0877243e3688f86b33237928d7868fe4d78dcf275d465e2b"
+      "sha256": "bd8d6d8cadbb4bd1ca3452ce79879afec9680091bb7f724fe6931b40523403a1"
     },
     {
       "executable": false,
       "path": "ora_review/__init__.py",
-      "sha256": "70326f00d668e7aa68654d3e4012cc528cba65e496945ee569e2a020a3bed94f"
+      "sha256": "833f3fb2492994b1e520bd41bc5fd7c112c33e41abcdfa07b191688e62d549cf"
     },
     {
       "executable": false,
       "path": "ora_review/adapters.py",
-      "sha256": "43deb1fed1e46559d81529754835e7ea62d3e2ef9ba7c6411bdac82d1f5aab59"
+      "sha256": "562bcf8f34e31825751c2994a4c2865c4ad9080853e5a73ac244a65e2817b528"
     },
     {
       "executable": false,
       "path": "ora_review/cli.py",
-      "sha256": "a5c690d1f978cf0499039f9deac87181a99e667067e8032b79b0a5626627474f"
+      "sha256": "f4550438d6fb00267d6e8d368b76a8bf100c957e58f3742beadfd4331dc44b8a"
     },
     {
       "executable": false,
@@ -168,27 +168,27 @@
     {
       "executable": false,
       "path": "packages/claude/ora-gear-3/SKILL.md",
-      "sha256": "fa09fa381f11995b56aaa21eccc4c5c04bc35b05a7650ac274d48d28da8791a1"
+      "sha256": "1446dd3007e6bcbfc42902dc6cc29108e1c371403906a7d3e36c68bd5075c34d"
     },
     {
       "executable": false,
       "path": "packages/claude/ora-gear-4/SKILL.md",
-      "sha256": "a38e0559208c082461c2506eadb404455982b1df451d4c6ba913cd92606a57c3"
+      "sha256": "adb85236058ed1573807946aafc84a20ebeaec6ef6d0ef0bc13f38af3c70bc25"
     },
     {
       "executable": false,
       "path": "packages/codex/ora-gear-3/SKILL.md",
-      "sha256": "4970c2c78e2743e7286869a13e3d4ac27e6de3b6c60522509a1a30f0077a0688"
+      "sha256": "db331d432e0d6104e73f6b61ad34498ed0bb8158c5fbb49e080146e33d8f94ea"
     },
     {
       "executable": false,
       "path": "packages/codex/ora-gear-4/SKILL.md",
-      "sha256": "b893dd653cecbb3d0725bff00f449bd4e67105ba47185226fba7ede91b004338"
+      "sha256": "6784747109afeca57efdf5736014382b4c8d81e53ee7cd8987f74ac47c13f09e"
     },
     {
       "executable": false,
       "path": "pyproject.toml",
-      "sha256": "214c023e23daf4e86876dcd55fc294881be6a190af5efcbb6b9286655b1449e4"
+      "sha256": "bf2db0d5bc0af7201dca727ab1bf6af14be3cae63700949e94ed872de4d024ea"
     },
     {
       "executable": false,
@@ -208,7 +208,7 @@
     {
       "executable": false,
       "path": "tests/test_acceptance.py",
-      "sha256": "c132f59913a32a59c2a53506f6dd2aae0f707af6ad271c94657ad21e10e36462"
+      "sha256": "9c8b8e02306ec193947059af16cc5d45090712fd5b7107ce513d22e8913ce21a"
     }
   ],
   "version": 1

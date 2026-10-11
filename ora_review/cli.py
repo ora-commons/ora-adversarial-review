@@ -7,7 +7,7 @@ import sys
 from pathlib import Path
 from typing import Sequence
 
-from .adapters import BridgeAdapter, ClaudeAdapter, CodexAdapter
+from .adapters import ANALYTICAL_ENGINES, BridgeAdapter, ClaudeAdapter, CodexAdapter
 from .errors import CallFailure, OraReviewError
 from .models import UserMaterial
 from .runner import ReviewRunner, RunRequest
@@ -54,9 +54,13 @@ def _parser(tool: str) -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--native",
-        choices=("codex", "claude"),
+        choices=ANALYTICAL_ENGINES,
         default="codex",
-        help="native Gear role engine (default: codex)",
+        help=(
+            "native Gear role engine (default: codex); codex and claude run "
+            "their own native adapters, every other engine runs fresh "
+            "text-only analytical calls through Agent Bridge"
+        ),
     )
     parser.add_argument(
         "--model",
@@ -168,7 +172,7 @@ def _run(tool: str, argv: Sequence[str] | None = None) -> int:
     parser = _parser(tool)
     args = parser.parse_args(list(argv) if argv is not None else None)
     runner: ReviewRunner | None = None
-    native: CodexAdapter | ClaudeAdapter | None = None
+    native: CodexAdapter | ClaudeAdapter | BridgeAdapter | None = None
     try:
         if args.model and args.native != "claude":
             raise OraReviewError("--model requires --native claude.")
@@ -206,20 +210,35 @@ def _run(tool: str, argv: Sequence[str] | None = None) -> int:
                 raise OraReviewError("The current-answer file is empty.")
 
         print(_configuration_line(tool, args), file=sys.stderr)
-        native = (
-            CodexAdapter()
-            if args.native == "codex"
-            else (
-                ClaudeAdapter(model=args.model)
-                if args.model
-                else ClaudeAdapter()
-            )
+        initiator = "ora-gear-3" if tool == "gear3" else "ora-gear-4"
+        if args.native == "codex":
+            native = CodexAdapter()
+        elif args.native == "claude":
+            native = ClaudeAdapter(model=args.model) if args.model else ClaudeAdapter()
+        else:
+            try:
+                native, native_readiness = BridgeAdapter.prepare(
+                    peer=args.native, initiator=initiator
+                )
+            except CallFailure as failure:
+                raise OraReviewError(
+                    f"Selected native engine `{args.native}` is unavailable: "
+                    f"{failure.display()} No other engine was substituted. "
+                    f"Selectable engines: {', '.join(ANALYTICAL_ENGINES)}."
+                ) from failure
+            print(native_readiness, file=sys.stderr)
+        native_label = {
+            "codex": "Codex",
+            "claude": "Claude Code",
+        }.get(args.native, f"`{args.native}`")
+        native_route = (
+            f"fresh {native_label} contexts"
+            if args.native in ("codex", "claude")
+            else f"fresh Agent Bridge calls to `{args.native}`"
         )
-        native_label = "Codex" if args.native == "codex" else "Claude Code"
         peer_adapter = None
         notices: tuple[str, ...] = ()
         if args.peer:
-            initiator = "ora-gear-3" if tool == "gear3" else "ora-gear-4"
             try:
                 peer_adapter, readiness = BridgeAdapter.prepare(
                     peer=args.peer, initiator=initiator
@@ -227,7 +246,7 @@ def _run(tool: str, argv: Sequence[str] | None = None) -> int:
                 print(readiness, file=sys.stderr)
                 print(
                     "Peer-owned roles use fresh Agent Bridge calls; native roles use "
-                    f"fresh {native_label} contexts selected by `--native {args.native}`. "
+                    f"{native_route} selected by `--native {args.native}`. "
                     "Fresh context is guaranteed; provider or model "
                     "diversity is promised only when separately established. "
                     + (
@@ -252,14 +271,16 @@ def _run(tool: str, argv: Sequence[str] | None = None) -> int:
                 exact = failure.display()
                 notice = (
                     f"Selected peer `{args.peer}` is unavailable: {exact} "
-                    f"This run will use fresh internal {native_label} calls instead."
+                    f"This run will use fresh internal {native_label} calls instead; "
+                    "no other peer was substituted. Other Bridge targets can be "
+                    f"selected explicitly with `--peer`: {', '.join(ANALYTICAL_ENGINES)}."
                 )
                 print(notice, file=sys.stderr)
                 notices = (notice,)
         else:
             print(
-                f"Entirely internal route: every role uses a fresh {native_label} "
-                f"context selected by `--native {args.native}`. "
+                f"Entirely internal route: every role uses {native_route} "
+                f"selected by `--native {args.native}`. "
                 "This promises context separation, not different evidence, training, "
                 "models, or blind spots. "
                 + (

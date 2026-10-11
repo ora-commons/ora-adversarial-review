@@ -14,12 +14,20 @@ import tempfile
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Sequence
+from typing import Optional, Sequence
 
 from .errors import CallFailure, MalformedResponse
 
 
-MODEL_TIMEOUT_SECONDS = 900
+#: The six engines Gear can name for its analytical native and peer roles.
+#: Codex and Claude keep their own native adapters; the other four travel as
+#: text-only analytical calls through the Agent Bridge review transport, which
+#: never grants them a project-editing work mode.
+ANALYTICAL_ENGINES = ("codex", "claude", "zcode", "hermes", "qwen", "minimax")
+
+#: Grace given to a process group this run owns when it is being cleaned up
+#: after cancellation or failure. It bounds cleanup, not AI work: an
+#: analytical model call itself has no elapsed-time cutoff at all.
 PROCESS_GRACE_SECONDS = 10
 
 
@@ -62,9 +70,18 @@ def _run_bounded(
     *,
     cwd: Path,
     body: bytes,
-    timeout: float,
+    timeout: float | None,
     env: dict[str, str] | None = None,
 ) -> _ProcessResult:
+    """Start one process group and wait for it.
+
+    ``timeout`` bounds only calls that are not AI work: a readiness or record
+    question may be cut short. A model call passes ``None`` and is never
+    killed for elapsed time — it ends on completion, explicit cancellation,
+    or its own terminal error, and the grace constant above bounds only the
+    cleanup of the group this call started.
+    """
+
     cancelled: int | None = None
     waiting = False
 
@@ -175,7 +192,7 @@ class CodexAdapter:
                 argv,
                 cwd=root,
                 body=packet.encode("utf-8"),
-                timeout=MODEL_TIMEOUT_SECONDS,
+                timeout=None,
             )
             if result.returncode != 0:
                 detail = _display_bytes(result.stderr) or f"exit {result.returncode}"
@@ -311,7 +328,7 @@ class ClaudeAdapter:
                 argv,
                 cwd=root,
                 body=packet.encode("utf-8"),
-                timeout=MODEL_TIMEOUT_SECONDS,
+                timeout=None,
                 env=environment,
             )
             if result.returncode != 0:
@@ -324,30 +341,68 @@ class ClaudeAdapter:
 class _BridgeCommand:
     root: Path
     argv: tuple[str, ...]
+    version: str | None = None
+
+    @classmethod
+    def _at(cls, candidate: Path) -> Optional["_BridgeCommand"]:
+        root = candidate.expanduser().resolve()
+        if not (
+            (root / "bridge" / "__main__.py").is_file()
+            and (root / "bridge" / "cli.py").is_file()
+        ):
+            return None
+        version = None
+        try:
+            found = re.search(
+                r'^VERSION\s*=\s*"([^"\n]+)"',
+                (root / "bridge" / "__init__.py").read_text(encoding="utf-8"),
+                re.MULTILINE,
+            )
+        except OSError:
+            found = None
+        if found is not None:
+            version = found.group(1)
+        return cls(root, (sys.executable, "-m", "bridge"), version)
 
     @classmethod
     def locate(cls) -> "_BridgeCommand":
+        """Resolve the selected Bridge copy and never fall back from it.
+
+        ``AGENT_BRIDGE_HOME`` names the exact selected copy: if that path is
+        not a usable Bridge checkout, the failure names it and no other
+        installation is consulted. With no selection, the documented
+        standalone default ``~/agent-bridge`` is used.
+        """
         configured = os.environ.get("AGENT_BRIDGE_HOME")
-        candidates = [Path(configured).expanduser()] if configured else []
-        candidates.append(Path.home() / "agent-bridge")
-        for candidate in candidates:
-            root = candidate.resolve()
-            if (root / "bridge" / "__main__.py").is_file() and (
-                root / "bridge" / "cli.py"
-            ).is_file():
-                return cls(root, (sys.executable, "-m", "bridge"))
-        raise CallFailure(
-            "No Agent Bridge checkout was found.",
-            "Set AGENT_BRIDGE_HOME to its absolute directory or install it at "
-            f"{Path.home() / 'agent-bridge'}.",
-        )
+        if configured:
+            selected = cls._at(Path(configured))
+            if selected is None:
+                raise CallFailure(
+                    f"The selected Agent Bridge path `{configured}` is not a "
+                    "usable Bridge checkout: it has no `bridge/__main__.py` and "
+                    "`bridge/cli.py`. No fallback to another installation was "
+                    "attempted."
+                )
+            return selected
+        default = cls._at(Path.home() / "agent-bridge")
+        if default is None:
+            raise CallFailure(
+                "No Agent Bridge checkout was found.",
+                "Set AGENT_BRIDGE_HOME to its absolute directory or install it at "
+                f"{Path.home() / 'agent-bridge'}.",
+            )
+        return default
+
+    def describe(self) -> str:
+        version = self.version or "version not readable"
+        return f"Agent Bridge copy used: {self.root} ({version})"
 
     def run(
         self,
         arguments: Sequence[str],
         *,
         body: str = "",
-        timeout: float = 60,
+        timeout: float | None = 60,
     ) -> _ProcessResult:
         return _run_bounded(
             (*self.argv, *arguments),
@@ -358,7 +413,13 @@ class _BridgeCommand:
 
 
 class BridgeAdapter:
-    """Carry peer-owned packets through one Format 2 Bridge session."""
+    """Carry analytical packets through one Format 2 Bridge session.
+
+    The class attribute names the transport; each instance answers with the
+    engine actually selected — the Bridge target whose session it carries —
+    so records and disclosures preserve the chosen participant, and no other
+    engine is ever substituted for it.
+    """
 
     engine = "agent-bridge"
 
@@ -377,6 +438,7 @@ class BridgeAdapter:
     ) -> None:
         self.command = command
         self.peer = peer
+        self.engine = peer
         self.initiator = initiator
         self.session_dir = session_dir
         self.session_verified = session_verified
@@ -397,6 +459,7 @@ class BridgeAdapter:
             raise CallFailure(
                 f"Agent Bridge readiness for `{peer}` succeeded without a status sentence."
             )
+        readiness = f"{readiness}\n{command.describe()}"
         session_root = Path.home() / ".agent-bridge" / "sessions"
         session_dir = session_root / f"{initiator}-{uuid.uuid4().hex}"
         description = (
@@ -436,6 +499,11 @@ class BridgeAdapter:
         ), readiness
 
     def call(self, packet: str, *, role: str) -> str:
+        """One fresh analytical call, with no elapsed-time cutoff.
+
+        No deadline is passed to Bridge and none is imposed here: the call
+        ends when the peer answers, the caller cancels, or transport fails.
+        """
         self.last_call_notice = ""
         self.last_call_provenance = None
         before = self._response_paths()
@@ -445,11 +513,9 @@ class BridgeAdapter:
                     "run",
                     "--session",
                     str(self.session_dir),
-                    "--timeout",
-                    str(MODEL_TIMEOUT_SECONDS),
                 ),
                 body=packet,
-                timeout=MODEL_TIMEOUT_SECONDS + 30,
+                timeout=None,
             )
         except CallFailure as failure:
             detail = published_detail = failure.display()

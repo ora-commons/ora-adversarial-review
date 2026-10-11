@@ -1,6 +1,6 @@
 ---
 name: ora-gear-3
-description: Run standalone Ora Gear 3 on an exact request or current answer, using Codex by default or an explicitly selected Claude native engine.
+description: Run standalone Ora Gear 3 on an exact request or current answer, using Codex by default or an explicitly selected native engine.
 ---
 
 # Ora Gear 3
@@ -16,8 +16,10 @@ that “verbatim.” If there is no exact machine-readable source, explain this
 host limitation plainly instead of pretending the fidelity guarantee holds.
 
 - One-pass is the default. Add `--consensus` only when the user asks for it.
-- Omit `--native` or use `--native codex` for the compatible Codex default. If
-  the caller explicitly selects Claude Code, use `--native claude`. Add
+- Omit `--native` or use `--native codex` for the compatible Codex default. Pass
+  the caller's explicit engine choice through unchanged — `--native claude`, or
+  `--native zcode`/`hermes`/`qwen`/`minimax` for a fresh analytical route through
+  Agent Bridge. Add
   `--model fable` or `--model claude-fable-5` only when the caller also selects
   that Claude Fable model; never choose or switch an engine or model silently.
 - Add `--peer TARGET` only for the Agent Bridge target the user selected. Pass
