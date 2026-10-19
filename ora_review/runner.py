@@ -89,6 +89,7 @@ class ReviewRunner:
         self.native = native
         self.native_engine = native.engine
         self.native_model_selector = getattr(native, "model", None)
+        self.native_effort_selector = getattr(native, "effort", None)
         self.peer = peer
         self.packet_builder = packet_builder or PacketBuilder()
         self._peer_active = peer is not None
@@ -109,6 +110,7 @@ class ReviewRunner:
             route="external" if self._peer_active else "internal",
             native_engine=self.native_engine,
             native_model_selector=self.native_model_selector,
+            native_effort_selector=self.native_effort_selector,
             material=request.material,
             instruction_snapshot=snapshot,
             run_root=request.run_root,
@@ -154,6 +156,7 @@ class ReviewRunner:
             route="external" if self._peer_active else "internal",
             native_engine=self.native_engine,
             native_model_selector=self.native_model_selector,
+            native_effort_selector=self.native_effort_selector,
             material=request.material,
             instruction_snapshot=snapshot,
             run_root=request.run_root,
@@ -592,6 +595,10 @@ class ReviewRunner:
                         self._record_native_model_attribution(
                             record, record_title, role
                         )
+                    else:
+                        self._record_peer_model_attribution(
+                            record, record_title, role
+                        )
                 finally:
                     disclosure = getattr(adapter, "last_call_notice", "")
                     if disclosure:
@@ -680,15 +687,49 @@ class ReviewRunner:
         role: str,
     ) -> None:
         effective_model = getattr(self.native, "effective_model", None)
-        if effective_model is None:
+        if effective_model is not None:
+            selector = self.native_model_selector or "not explicitly selected"
+            record.append(
+                f"{record_title} native model attribution",
+                f"Role: `{role}`\n\n"
+                f"Requested native model selector: `{selector}`\n\n"
+                f"Returned effective native model: `{effective_model}`",
+            )
             return
-        selector = self.native_model_selector or "not explicitly selected"
+        reported_model = getattr(self.native, "reported_model", None)
+        reported_effort = getattr(self.native, "reported_effort", None)
+        if reported_model is None and reported_effort is None:
+            return
         record.append(
             f"{record_title} native model attribution",
             f"Role: `{role}`\n\n"
-            f"Requested native model selector: `{selector}`\n\n"
-            f"Returned effective native model: `{effective_model}`",
+            f"Engine: `{self.native_engine}`\n\n"
+            f"Reported model: `{reported_model or 'not reported'}`\n\n"
+            f"Reported reasoning effort: `{reported_effort or 'not reported'}`",
         )
+
+    def _record_peer_model_attribution(
+        self,
+        record: RunRecord,
+        record_title: str,
+        role: str,
+    ) -> None:
+        choices = getattr(self.peer, "last_call_choices", None)
+        if choices is None:
+            return
+        body = (
+            f"Role: `{role}`\n\n"
+            f"Peer engine: `{self.peer.engine}`\n\n"
+        )
+        if choices.model is not None:
+            body += f"Reported model: `{choices.model}`\n\n"
+        if choices.effort is not None:
+            body += f"Reported reasoning effort: `{choices.effort}`\n\n"
+        if choices.requested_model is not None:
+            body += f"Requested model: `{choices.requested_model}`\n\n"
+        if choices.requested_effort is not None:
+            body += f"Requested reasoning effort: `{choices.requested_effort}`\n\n"
+        record.append(f"{record_title} peer model attribution", body.rstrip("\n"))
 
     def _reset_route(self, initial_notices: Sequence[str]) -> None:
         self._peer_active = self.peer is not None

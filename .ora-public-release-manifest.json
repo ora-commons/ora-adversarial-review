@@ -18,27 +18,27 @@
     {
       "executable": false,
       "path": "README.md",
-      "sha256": "00354e842536b7c98a08cee434bc99e46ebff00890431fd6ecdd57112589254d"
+      "sha256": "c53a3090728b3750d094d75550fb5665224f8411b3af6158d117e26cdb8d973a"
     },
     {
       "executable": false,
       "path": "SPECIFICATION.md",
-      "sha256": "bd8d6d8cadbb4bd1ca3452ce79879afec9680091bb7f724fe6931b40523403a1"
+      "sha256": "b635b2fd591e02507b283e7ae5ae069c1564a4eccffeb365ef01646a54acec22"
     },
     {
       "executable": false,
       "path": "ora_review/__init__.py",
-      "sha256": "833f3fb2492994b1e520bd41bc5fd7c112c33e41abcdfa07b191688e62d549cf"
+      "sha256": "f5fa498308079753a0c2b7cadc3ea17a88b4a6a7ddfc49b958a0d2802f31d365"
     },
     {
       "executable": false,
       "path": "ora_review/adapters.py",
-      "sha256": "562bcf8f34e31825751c2994a4c2865c4ad9080853e5a73ac244a65e2817b528"
+      "sha256": "36dfc2cd55027aa3d5d24b68a2d3755bcecccf621f08ece44006f7dcbe4b5c4e"
     },
     {
       "executable": false,
       "path": "ora_review/cli.py",
-      "sha256": "f4550438d6fb00267d6e8d368b76a8bf100c957e58f3742beadfd4331dc44b8a"
+      "sha256": "c50a336a8e9d8ee96fed5426b1bead68a44eaaecf8b0bae9cb0396b07f0a5f92"
     },
     {
       "executable": false,
@@ -153,12 +153,12 @@
     {
       "executable": false,
       "path": "ora_review/record.py",
-      "sha256": "740124c93fdf4afb14fbf369f962ce02e926d54a444c5263852626dfcde64777"
+      "sha256": "c7fec402316b4284798131065ea787f3815f3423c570532c170f25acad4a787a"
     },
     {
       "executable": false,
       "path": "ora_review/runner.py",
-      "sha256": "8f4a8224cc0c5ae78491902605d287259cfab0e4aeb2c6d5229a6727dc476b41"
+      "sha256": "564b0453fdc0d897e3b851044217d555029673a8dbd10bf43ab5e29d81f50664"
     },
     {
       "executable": false,
@@ -188,7 +188,7 @@
     {
       "executable": false,
       "path": "pyproject.toml",
-      "sha256": "bf2db0d5bc0af7201dca727ab1bf6af14be3cae63700949e94ed872de4d024ea"
+      "sha256": "1bcc1693952d9ce5c27b6df54612a531e5acb321cdbbd6cbcbc51e6a97099950"
     },
     {
       "executable": false,
@@ -208,7 +208,7 @@
     {
       "executable": false,
       "path": "tests/test_acceptance.py",
-      "sha256": "9c8b8e02306ec193947059af16cc5d45090712fd5b7107ce513d22e8913ce21a"
+      "sha256": "475a60dbc3bbed5af0e30cc6e1b5cd7cfe2c16425e73ffe8d39269e329ecd646"
     }
   ],
   "version": 1

@@ -31,6 +31,7 @@ class RunRecord:
         breadth: str | None = None,
         native_engine: str | None = None,
         native_model_selector: str | None = None,
+        native_effort_selector: str | None = None,
         selected_peer: str | None = None,
         requested_roots: Sequence[str] = (),
     ) -> "RunRecord":
@@ -69,6 +70,10 @@ class RunRecord:
         if native_model_selector is not None:
             config_lines.append(
                 f"Requested native model selector: `{native_model_selector}`"
+            )
+        if native_effort_selector is not None:
+            config_lines.append(
+                f"Requested native reasoning effort: `{native_effort_selector}`"
             )
         if selected_peer is not None:
             config_lines.extend(

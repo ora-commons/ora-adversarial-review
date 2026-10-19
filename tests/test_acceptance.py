@@ -21,6 +21,7 @@ from ora_review import adapters as adapters_module
 from ora_review.adapters import (
     BridgeAdapter,
     ClaudeAdapter,
+    CodexAdapter,
     _BridgeCommand,
     _ProcessResult,
 )
@@ -1246,7 +1247,7 @@ class AcceptanceTests(unittest.TestCase):
             self.assertEqual(output_bytes.getvalue(), answer.encode("utf-8"))
             self.assertIn(warnings, stderr.getvalue())
             self.assertIn(
-                "Effective model and effort are not selected or reported.",
+                "the model and reasoning effort Codex reports using are recorded.",
                 stderr.getvalue(),
             )
             self.assertNotIn(
@@ -1317,12 +1318,13 @@ class AcceptanceTests(unittest.TestCase):
                     )
                 else:
                     self.assertIn(
-                        "Effective model and effort are not selected or reported.",
+                        "the model and reasoning effort Codex reports using "
+                        "are recorded.",
                         stderr.getvalue(),
                     )
                     self.assertNotIn(
-                        "successful native call must return one unambiguous exact model "
-                        "attribution",
+                        "successful native call must return one unambiguous exact "
+                        "model attribution",
                         stderr.getvalue(),
                     )
                 record = next((fixture / "runs").glob("*/RUN.md"))
@@ -1635,9 +1637,216 @@ class ParticipantAndTransportContractTests(unittest.TestCase):
             bridge.call("# packet", role="gear-3-review-1")
             self.assertEqual(command.arguments, [("run", "--session", str(session))])
 
+    def test_codex_model_and_effort_selection_and_reporting(self) -> None:
+        def write_fake_codex(
+            fixture: Path, *, reported_model: str, reported_effort: str
+        ) -> Path:
+            argv_path = fixture / "codex-argv.json"
+            executable = fixture / "codex"
+            executable.write_text(
+                f"#!{sys.executable}\n"
+                "import json, sys\n"
+                "from pathlib import Path\n"
+                f"Path({str(argv_path)!r}).write_text("
+                "json.dumps(sys.argv[1:]), encoding='utf-8')\n"
+                "sys.stderr.write(\n"
+                "    'OpenAI Codex v0.162.1\\n'\n"
+                "    '--------\\n'\n"
+                "    'workdir: /tmp\\n'\n"
+                f"    'model: {reported_model}\\n'\n"
+                "    'provider: openai\\n'\n"
+                "    'approval: never\\n'\n"
+                "    'sandbox: read-only\\n'\n"
+                f"    'reasoning effort: {reported_effort}\\n'\n"
+                "    'reasoning summaries: none\\n'\n"
+                "    '--------\\n'\n"
+                ")\n"
+                "out = sys.argv[sys.argv.index('--output-last-message') + 1]\n"
+                f"Path(out).write_text({_review('PASS')!r}, encoding='utf-8')\n",
+                encoding="utf-8",
+            )
+            executable.chmod(0o700)
+            return executable
+
+        for named in (True, False):
+            with self.subTest(named=named), tempfile.TemporaryDirectory() as root:
+                fixture = Path(root)
+                request_path = fixture / "request.md"
+                request_path.write_text("Exact request.", encoding="utf-8")
+                answer_path = fixture / "answer.md"
+                answer_path.write_text("complete answer", encoding="utf-8")
+                executable = write_fake_codex(
+                    fixture,
+                    reported_model="gpt-5.3" if named else "gpt-5.1-codex",
+                    reported_effort="high" if named else "medium",
+                )
+                output_bytes = io.BytesIO()
+                stdout = io.TextIOWrapper(output_bytes, encoding="utf-8")
+                stderr = io.StringIO()
+                arguments = [
+                    "--request",
+                    str(request_path),
+                    "--current-answer",
+                    str(answer_path),
+                ]
+                if named:
+                    arguments.extend(
+                        ("--codex-model", "gpt-5.3", "--codex-effort", "high")
+                    )
+                with (
+                    patch.object(
+                        cli_module,
+                        "CodexAdapter",
+                        side_effect=lambda **kwargs: CodexAdapter(
+                            str(executable), **kwargs
+                        ),
+                    ),
+                    patch.object(
+                        cli_module,
+                        "RunRequest",
+                        side_effect=lambda **kwargs: RunRequest(
+                            run_root=fixture / "runs", **kwargs
+                        ),
+                    ),
+                    patch.object(cli_module.sys, "stdout", stdout),
+                    patch.object(cli_module.sys, "stderr", stderr),
+                ):
+                    exit_code = cli_module._run("gear3", arguments)
+                    stdout.flush()
+
+                self.assertEqual(exit_code, 0)
+                self.assertEqual(output_bytes.getvalue(), b"complete answer")
+                codex_arguments = json.loads(
+                    (fixture / "codex-argv.json").read_text(encoding="utf-8")
+                )
+                status = stderr.getvalue()
+                record = next((fixture / "runs").glob("*/RUN.md"))
+                record_text = record.read_text(encoding="utf-8")
+                self.assertIn("Native engine: `codex`", record_text)
+                self.assertIn(
+                    "the model and reasoning effort Codex reports using are recorded.",
+                    status,
+                )
+                if named:
+                    self.assertEqual(
+                        codex_arguments[codex_arguments.index("-m") + 1],
+                        "gpt-5.3",
+                    )
+                    self.assertEqual(
+                        codex_arguments[codex_arguments.index("-c") + 1],
+                        "model_reasoning_effort=high",
+                    )
+                    self.assertIn(
+                        "Requested Codex model `gpt-5.3` and reasoning effort `high`.",
+                        status,
+                    )
+                    self.assertIn(
+                        "Requested native model selector: `gpt-5.3`", record_text
+                    )
+                    self.assertIn(
+                        "Requested native reasoning effort: `high`", record_text
+                    )
+                    self.assertIn("Reported model: `gpt-5.3`", record_text)
+                    self.assertIn("Reported reasoning effort: `high`", record_text)
+                else:
+                    self.assertNotIn("-m", codex_arguments)
+                    self.assertNotIn("-c", codex_arguments)
+                    self.assertIn(
+                        "No Codex model or reasoning effort was requested", status
+                    )
+                    self.assertNotIn("Requested native model selector", record_text)
+                    self.assertNotIn(
+                        "Requested native reasoning effort", record_text
+                    )
+                    self.assertIn("Reported model: `gpt-5.1-codex`", record_text)
+                    self.assertIn("Reported reasoning effort: `medium`", record_text)
+
+        class CodexChoicesBridgeCommand:
+            """A fake Bridge whose codex replies carry the choices lines."""
+
+            def __init__(self, session: Path) -> None:
+                self.session = session
+                self.bodies: list[str] = []
+                self.arguments: list[tuple[str, ...]] = []
+
+            def run(self, arguments, *, body: str = "", timeout: float = 60):
+                self.bodies.append(body)
+                self.arguments.append(tuple(arguments))
+                messages = self.session / "messages"
+                messages.mkdir(parents=True, exist_ok=True)
+                existing = [
+                    int(path.name.split("-", 1)[0])
+                    for path in messages.glob("*-peer-to-initiator.md")
+                    if path.name.split("-", 1)[0].isdigit()
+                ]
+                sequence = max(existing, default=0) + 2
+                header = "\n".join(
+                    (
+                        f"# Message {sequence:04d}",
+                        "From: codex",
+                        "To: ora-gear-3",
+                        "Model: gpt-5.3",
+                        "Effort: high",
+                        "Requested-Model: gpt-5.3",
+                        "Requested-Effort: high",
+                    )
+                )
+                response = messages / f"{sequence:04d}-peer-to-initiator.md"
+                response.write_text(
+                    f"{header}\n\n## Body\n\n" + _review("PASS"), encoding="utf-8"
+                )
+                return _ProcessResult(
+                    0, (str(response) + "\n").encode("utf-8"), b""
+                )
+
+        with tempfile.TemporaryDirectory() as root:
+            fixture = Path(root)
+            session = fixture / "session"
+            command = CodexChoicesBridgeCommand(session)
+            bridge = BridgeAdapter(
+                command,
+                peer="codex",
+                initiator="ora-gear-3",
+                session_dir=session,
+                model="gpt-5.3",
+                effort="high",
+            )
+            native = ScriptedAdapter({})
+            result = ReviewRunner(native, bridge).run_gear3(
+                RunRequest(
+                    material=UserMaterial("request"),
+                    existing_answer="answer",
+                    run_root=fixture / "runs",
+                )
+            )
+            self.assertEqual(result.status, "PASSED")
+            self.assertEqual(result.answer, "answer")
+            self.assertEqual(native.calls, [])
+            self.assertEqual(
+                command.arguments,
+                [
+                    (
+                        "run",
+                        "--session",
+                        str(session),
+                        "--model",
+                        "gpt-5.3",
+                        "--effort",
+                        "high",
+                    )
+                ],
+            )
+            run_text = Path(result.run_path).read_text(encoding="utf-8")
+            self.assertIn(_review("PASS"), run_text)
+            self.assertIn("Peer engine: `codex`", run_text)
+            self.assertIn("Reported model: `gpt-5.3`", run_text)
+            self.assertIn("Reported reasoning effort: `high`", run_text)
+            self.assertIn("Requested model: `gpt-5.3`", run_text)
+            self.assertIn("Requested reasoning effort: `high`", run_text)
+
     def test_selected_bridge_home_is_bound_and_reported(self) -> None:
         def make_bridge(root: Path, version: str) -> None:
-            package = root / "bridge"
+            package = root / "ora_agent_bridge"
             package.mkdir(parents=True)
             (package / "__main__.py").write_text("", encoding="utf-8")
             (package / "cli.py").write_text("", encoding="utf-8")

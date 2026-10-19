@@ -406,8 +406,10 @@ The run file contains, in order:
 
 After every successful Claude-native role, the record also names that role, the
 requested selector or lack of one, and the one exact effective model returned by
-the official CLI. Codex records the selected engine but makes no effective-model
-or effort claim.
+the official CLI. After every successful Codex-native role, the record names
+that role, the selected engine, and the model and reasoning effort Codex itself
+states at start-up; a half Codex did not state is recorded as not reported, and
+nothing is inferred from what the caller requested.
 
 Python owns the headings, boundaries, ordering, and atomic writes. Models supply
 only the body of their assigned output block.
@@ -936,11 +938,12 @@ different evidence, training, models, or blind spots.
 Ora Adversarial Review is an application above the frozen Bridge Format 2
 courier. Its adapter:
 
-1. runs `python3 -m bridge check --peer <target>` from the Bridge checkout;
+1. runs `python3 -m ora_agent_bridge check --peer <target>` from the Ora
+   Agent Bridge checkout;
 2. creates one session with inert initiator `ora-gear-3` or
    `ora-gear-4` and no `Project:`;
 3. sends each peer role as one exact complete body to
-   `python3 -m bridge run --session <session>` from that checkout;
+   `python3 -m ora_agent_bridge run --session <session>` from that checkout;
 4. records the returned body byte-for-byte in `RUN.md`.
 
 The adapter uses Ora's own Python interpreter for these module calls, not an
@@ -967,9 +970,13 @@ reconstruct either direction.
 The Codex adapter starts `codex exec` in a new temporary directory with
 ephemeral execution, user configuration and repository rules ignored, a
 read-only sandbox, no Git-repository requirement, and an operation-owned final
-response file. It reads and returns that file as UTF-8 without selecting or
-claiming an effective model or effort. The temporary directory and response
-file are removed after the foreground call finishes or fails.
+response file. A caller-named model reaches every call as `-m` and a
+caller-named reasoning effort as `-c model_reasoning_effort=`; with neither
+named, Codex's own default applies. It reads and returns that file as UTF-8 and
+also reads the model and reasoning effort Codex itself states in its start-up
+lines, for the run record, inferring nothing Codex did not state. The temporary
+directory and response file are removed after the foreground call finishes or
+fails.
 
 The Claude adapter starts the official `claude` command in a new temporary
 directory with print mode, no session persistence, safe and restricted modes,
@@ -1009,7 +1016,8 @@ selected native engine, any requested Claude model selector, selected peer and
 readiness—or internal route—and says that:
 
 - review roles use fresh contexts;
-- Codex does not select or report an effective model or effort;
+- Codex selects a model and reasoning effort only when one is named, and the
+  model and reasoning effort Codex reports using are recorded;
 - Claude requires one exact returned effective model for every successful
   native role, records each attribution, and verifies it against a requested
   Fable selector when one was supplied;
@@ -1347,7 +1355,7 @@ the existing call boundary, not a router or general engine abstraction.
 | Peer | One explicit Bridge target; omission requests internal execution |
 | Unavailable peer | Loud internal fallback; never another automatic target |
 | Bridge project | Always omitted |
-| Attribution | Codex model/effort not selected or reported; every successful Claude role records one exact effective model |
+| Attribution | Codex selects model/effort only when named and records the pair Codex itself reports; every successful Claude role records one exact effective model |
 | Answer/status | Complete answer on the answer channel; status and record path separately |
 | Substantive `NOT PASSED` | Completed run, not a technical process failure |
 | Validator input | Exact request file, repeated explicit root IDs, and explicit peer |
