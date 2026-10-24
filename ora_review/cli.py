@@ -88,6 +88,24 @@ def _parser(tool: str) -> argparse.ArgumentParser:
             "or --peer codex"
         ),
     )
+    parser.add_argument(
+        "--repository", metavar="PATH",
+        help="absolute path of the target repository or task worktree; its "
+             "complete AGENTS.md (imports expanded) follows the core in "
+             "every packet",
+    )
+    parser.add_argument(
+        "--assigned-path", action="append", default=[], metavar="PATH",
+        help="path inside the target repository this assignment works on, "
+             "relative to the repository root or absolute; repeatable. The "
+             "narrower AGENTS.md rules for these paths join the repository "
+             "rules in every packet. Requires --repository",
+    )
+    parser.add_argument(
+        "--turn-instructions-file", metavar="FILE",
+        help="read this turn's original user message verbatim from FILE and "
+             "forward it to every packet after the core",
+    )
     parser.add_argument("--consensus", action="store_true")
     if tool == "gear3":
         parser.add_argument(
@@ -266,6 +284,16 @@ def _run(tool: str, argv: Sequence[str] | None = None) -> int:
                 if not commitment.strip():
                     raise OraReviewError("The commitment file contains no user words.")
 
+        current_turn_instructions = None
+        if args.turn_instructions_file:
+            current_turn_instructions = _read_file(
+                args.turn_instructions_file, "turn-instructions file"
+            )
+            if not current_turn_instructions.strip():
+                raise OraReviewError(
+                    "The turn-instructions file contains no user words."
+                )
+
         material = UserMaterial(
             original=_read_request(args.request),
             later_user_messages=_files(args.later_user, "later-user file"),
@@ -373,9 +401,14 @@ def _run(tool: str, argv: Sequence[str] | None = None) -> int:
             consensus=args.consensus,
             breadth=args.breadth if tool == "gear4" else "analytical",
             initial_notices=notices,
+            repository_path=(
+                Path(args.repository).expanduser() if args.repository else None
+            ),
+            assigned_paths=tuple(args.assigned_path),
+            current_turn_instructions=current_turn_instructions,
         )
         result = runner.run_gear3(request) if tool == "gear3" else runner.run_gear4(request)
-    except (CallFailure, OraReviewError, OSError) as failure:
+    except (CallFailure, OraReviewError, OSError, UnicodeDecodeError) as failure:
         if isinstance(failure, CallFailure):
             detail = failure.display()
         elif isinstance(failure, OSError):

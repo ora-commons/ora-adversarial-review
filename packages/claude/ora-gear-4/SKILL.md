@@ -26,6 +26,19 @@ no exact machine-readable source exists, explain that limitation.
   native role, retry, and fallback.
 - Add `--peer TARGET` only for the exact Agent Bridge target the user selected.
   Bridge is optional and owns target validation; do not discover or substitute.
+- Add `--repository PATH` with the absolute path of the repository or task
+  worktree the request works on — the real candidate worktree, not the
+  document folder, primary checkout, or temporary launch directory. Omit it
+  for non-repository work; never guess a repository from the request text.
+- Add `--assigned-path PATH` once per path the assignment actually works on
+  inside that repository — repository-relative or absolute, taken from the
+  assignment itself, never guessed from request text. Omit it for
+  whole-repository work.
+- Add `--turn-instructions-file FILE` when the current user message carries
+  instructions for this turn — for example an override naming a core rule
+  with its condition and scope. The file must hold the exact original
+  message, never a retyped or tidied copy. Omit the option when no current
+  user instruction exists.
 - Supply later user messages, assistant turns, and governing context only
   through their matching repeated file options and in the caller's order.
 - Run in the foreground. Preserve standard output exactly as the answer and

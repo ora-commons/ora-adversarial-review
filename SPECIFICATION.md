@@ -259,6 +259,40 @@ the exact stored artifact in the next role packet, not a paraphrase of it.
 
 Python constructs every role packet. Models never freehand the packet structure.
 
+Each Gear 3 or Gear 4 run resolves one per-run instruction prefix at launch,
+bound once and prepended to the controlling instructions of every packet that
+run builds — native, peer, reviser, recovery and the Gear 3 fallback alike.
+The validator is unchanged: it builds its packet without loading or binding
+an instruction prefix:
+
+    ## CORE RULES — UNIVERSAL
+    [the universal core read from the global instruction master, when
+    one is configured]
+
+    ## CURRENT USER INSTRUCTIONS — THIS TURN (VERBATIM)
+    [this turn's original user message, verbatim, when
+    --turn-instructions-file supplied it, closed by
+    ## END CURRENT USER INSTRUCTIONS]
+
+    ## REPOSITORY INSTRUCTIONS — <target repository or task worktree>
+    [that root's complete AGENTS.md, imports expanded, with
+    ### NARROWER RULES — <path> blocks for the assigned paths'
+    narrower AGENTS.md files, when --repository supplied it]
+
+The global instruction master is an optional Markdown file selected with the
+`ORA_INSTRUCTION_MASTER` environment variable or provisioned at
+`~/.config/ora/global-instructions.md`, carrying exactly one core marker pair.
+A selected or provisioned master that is missing, unreadable, or malformed
+stops the run with an error naming the file; a machine with no master
+configured runs without the core block and discloses that in its notices and
+run record.
+
+The turn body is protected data under section 5. Repository and assigned-path
+instructions are the caller's target rules, clearly labelled, and join the packet
+as supplied; they do not rewrite the role contract. Whenever a master is
+configured, the core rules lead every packet even when neither option is
+supplied.
+
 The order is fixed:
 
     # CONTROLLING ORA INSTRUCTIONS
@@ -395,7 +429,10 @@ The run file contains, in order:
 
 1. run identity, selected tool, native engine, any requested Claude model
    selector, and other configuration;
-2. instruction snapshot;
+2. instruction snapshot, opening with the resolved per-run instruction
+   prefix when one was bound — its exact text with its digest, including the
+   verbatim turn body between its headings, and the global instruction
+   master it was resolved from (`none` when no master is configured);
 3. protected user and governing-context blocks;
 4. any pre-existing complete current answer;
 5. each generated answer or Gear 4 lane artifact;

@@ -40,7 +40,7 @@ You need Python 3.10 or later and `git`. Clone the public repository at the rele
 and install into a virtual environment. In a POSIX shell:
 
 ```sh
-git clone --branch v0.4.0 https://github.com/ora-commons/ora-adversarial-review.git
+git clone --branch v0.5.0 https://github.com/ora-commons/ora-adversarial-review.git
 cd ora-adversarial-review
 python3 -m venv .venv
 . .venv/bin/activate
@@ -194,6 +194,27 @@ turning assistant or stage artifacts into user instructions or established facts
 Gear 3 accepts `--current-answer FILE` for "review this answer." Gear 4 uses analytical
 Breadth unless `--breadth committed --commitment FILE` is explicitly selected; the
 commitment file must contain the user's own nonempty words.
+
+### Global instruction master (optional)
+
+Every Gear 3 and Gear 4 packet leads with the universal core rules read from your
+global instruction master — an optional Markdown file you select with the
+`ORA_INSTRUCTION_MASTER` environment variable or provision at the default path
+`~/.config/ora/global-instructions.md`. The file must carry exactly one
+`<!-- ORA-CORE-BEGIN -->` and `<!-- ORA-CORE-END -->` marker pair around a nonempty
+core. A selected or provisioned master that is missing, unreadable, or malformed
+stops the run with an error naming the file. With no master configured at all, the
+run still works: every packet carries the role instructions only, and the notices
+and the run record disclose that. The validator is unchanged and carries no
+instruction prefix.
+
+Three further options carry instructions into every Gear packet.
+`--turn-instructions-file FILE` forwards this turn's original user message verbatim —
+use it when the current message carries instructions for this turn, and omit it when
+it does not. `--repository PATH` names the target repository or task worktree, whose
+complete AGENTS.md, imports expanded, joins every packet; repeatable
+`--assigned-path PATH` adds the narrower AGENTS.md rules covering those paths and
+requires `--repository`.
 
 The validator requires a file, explicit safe root IDs, and a peer. It neither reads
 standard input nor infers roots, and never accepts `--native` or `--model`.

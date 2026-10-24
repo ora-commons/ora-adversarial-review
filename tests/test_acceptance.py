@@ -27,7 +27,12 @@ from ora_review.adapters import (
 )
 from ora_review.errors import CallFailure, MalformedResponse, OraReviewError
 from ora_review.models import AnswerBoundary, StageMaterial, UserMaterial
-from ora_review.packet import PacketBuilder, extract_answer, sha256_text
+from ora_review.packet import (
+    NO_MASTER_NOTICE,
+    PacketBuilder,
+    extract_answer,
+    sha256_text,
+)
 from ora_review.runner import ReviewRunner, RunRequest
 from ora_review.validator import (
     ValidationRequest,
@@ -2015,6 +2020,579 @@ class ParticipantAndTransportContractTests(unittest.TestCase):
             COMPONENT_FACTS["bridge_transport"],
             {"format": 2, "actions": ("check", "record", "run")},
         )
+
+# ── ORA-92 launch-context prefix (Run B rebuild) ────────────────────────────
+# One prefix/loader mechanism: every packet of a run carries the resolved core
+# first when a global instruction master is configured, the exact current-turn
+# body when supplied, then the repository's rules; the binding is resolved once
+# per run and expires with it.
+
+TEST_CORE = (
+    "CORE — applies to every call this core is sent to.\n\n"
+    "C0 Who may change the core\n- Only the user may authorize an override."
+)
+TEST_OVERRIDE = (
+    "Override C5 for this turn only: answer directly without manufactured "
+    "pushback; applies while the draft stays under review."
+)
+
+# Every runner launch resolves the global instruction master through the real
+# chain: this module points ORA_INSTRUCTION_MASTER at a fixture master file,
+# so no test depends on (or writes into) anything outside its own fixtures.
+_MASTER_FIXTURE: dict[str, object] = {}
+_PRIOR_MASTER_ENV: dict[str, str] = {}
+
+
+def _write_master_file(path: Path, core: str) -> None:
+    path.write_text(
+        f"<!-- ORA-CORE-BEGIN -->\n{core}\n<!-- ORA-CORE-END -->\n",
+        encoding="utf-8",
+    )
+
+
+def setUpModule() -> None:
+    directory = Path(tempfile.mkdtemp(prefix="ora-master-fixture-"))
+    master = directory / "global-instructions.md"
+    _write_master_file(master, TEST_CORE)
+    _MASTER_FIXTURE["directory"] = directory
+    _MASTER_FIXTURE["master"] = master
+    if "ORA_INSTRUCTION_MASTER" in os.environ:
+        _PRIOR_MASTER_ENV["ORA_INSTRUCTION_MASTER"] = os.environ[
+            "ORA_INSTRUCTION_MASTER"
+        ]
+    os.environ["ORA_INSTRUCTION_MASTER"] = str(master)
+
+
+def tearDownModule() -> None:
+    if "ORA_INSTRUCTION_MASTER" in _PRIOR_MASTER_ENV:
+        os.environ["ORA_INSTRUCTION_MASTER"] = _PRIOR_MASTER_ENV[
+            "ORA_INSTRUCTION_MASTER"
+        ]
+    else:
+        os.environ.pop("ORA_INSTRUCTION_MASTER", None)
+    shutil.rmtree(str(_MASTER_FIXTURE["directory"]), ignore_errors=True)
+
+
+def _turn_body(packet: str) -> str:
+    """Extract the current-turn body exactly as forwarded (no normalization)."""
+    heading = "## CURRENT USER INSTRUCTIONS — THIS TURN (VERBATIM)"
+    end = "## END CURRENT USER INSTRUCTIONS"
+    raw = packet[packet.index(heading) + len(heading):packet.index(end)]
+    assert raw.startswith("\n\n"), raw[:20]
+    assert raw.endswith("\n\n"), raw[-20:]
+    return raw[2:-2]
+
+
+class LaunchContextTests(unittest.TestCase):
+    """The per-run prefix mechanism over the shared recording adapters."""
+
+    def _material(self) -> UserMaterial:
+        return UserMaterial(
+            original="Review this exact answer.",
+            later_user_messages=(TEST_OVERRIDE,),
+        )
+
+    def _repo(self, root: Path) -> Path:
+        repo = root / "repo"
+        (repo / "nested").mkdir(parents=True)
+        (repo / "AGENTS.md").write_text(
+            "# AGENTS.md\n\nRule: one file per change.\n\n@extra-rules.md\n",
+            encoding="utf-8",
+        )
+        (repo / "extra-rules.md").write_text(
+            "Imported rule: run the named checks.", encoding="utf-8"
+        )
+        (repo / "nested" / "AGENTS.md").write_text(
+            "Nested rule: keep the diff minimal.", encoding="utf-8"
+        )
+        return repo
+
+    def test_prefix_core_turn_repository_in_every_packet(self) -> None:
+        # Native, peer review and revision packets all carry the same bound
+        # prefix: core first, exact current-turn body, repository rules with
+        # imports expanded and the assigned path's narrower rules.
+        native = ScriptedAdapter({
+            "gear-3-initial-answer": [lambda p: _answer(p, "first answer")],
+            "gear-3-review-1": [_review("FAIL")],
+            "gear-3-revision-1": [
+                lambda p: _answer(p, "revised answer", revision=True)],
+        })
+        peer = ScriptedAdapter({"gear-3-review-1": [_review("FAIL")]})
+        runner = ReviewRunner(native=native, peer=peer)
+        with tempfile.TemporaryDirectory() as root:
+            result = runner.run_gear3(RunRequest(
+                material=self._material(),
+                current_turn_instructions=TEST_OVERRIDE,
+                repository_path=self._repo(Path(root)),
+                assigned_paths=("nested/AGENTS.md",),
+                run_root=Path(root) / "runs",
+            ))
+        self.assertNotEqual(result.status, "PASSED")
+        calls = native.calls + peer.calls
+        self.assertGreaterEqual(len(calls), 3)
+        for role, packet in calls:
+            self.assertLess(
+                packet.index("## CORE RULES — UNIVERSAL"),
+                packet.index("## UNIVERSAL LAWS"), role)
+            self.assertEqual(packet.count(TEST_CORE), 1, role)
+            self.assertEqual(_turn_body(packet), TEST_OVERRIDE, role)
+            self.assertIn("Rule: one file per change.", packet, role)
+            self.assertIn("Imported rule: run the named checks.", packet, role)
+            self.assertIn("NARROWER RULES — nested/AGENTS.md", packet, role)
+            self.assertLess(
+                packet.index("## CURRENT USER INSTRUCTIONS"),
+                packet.index("# SUPPLIED MATERIAL"), role)
+
+    def test_recovery_packet_carries_the_same_body(self) -> None:
+        # The fresh recovery call after a transport failure reuses the
+        # run's bound prefix unchanged.
+        native = ScriptedAdapter({
+            "gear-3-initial-answer": [
+                CallFailure("native engine unavailable"),
+                lambda p: _answer(p, "recovered answer")],
+            "gear-3-review-1": [_review("PASS")],
+        })
+        runner = ReviewRunner(native=native)
+        with tempfile.TemporaryDirectory() as root:
+            result = runner.run_gear3(RunRequest(
+                material=self._material(),
+                current_turn_instructions=TEST_OVERRIDE,
+                run_root=Path(root) / "runs",
+            ))
+        self.assertEqual(result.status, "PASSED")
+        self.assertEqual(len(native.calls), 3)
+        for role, packet in native.calls:
+            self.assertEqual(_turn_body(packet), TEST_OVERRIDE, role)
+
+    def test_binding_expires_with_the_run(self) -> None:
+        native = ScriptedAdapter({
+            "gear-3-initial-answer": [
+                lambda p: _answer(p, "answer one"),
+                lambda p: _answer(p, "answer two"),
+            ],
+            "gear-3-review-1": [_review("PASS"), _review("PASS")],
+        })
+        runner = ReviewRunner(native=native)
+        with tempfile.TemporaryDirectory() as root:
+            runs = Path(root)
+            runner.run_gear3(RunRequest(
+                material=self._material(),
+                current_turn_instructions=TEST_OVERRIDE,
+                run_root=runs / "runs"))
+            self.assertIsNone(runner.packet_builder.instruction_prefix)
+            # A later run without the field never reissues the old override
+            # as current instructions, even with the earlier message
+            # supplied as history; the core still leads.
+            native.calls.clear()
+            runner.run_gear3(RunRequest(
+                material=self._material(), run_root=runs / "runs2"))
+            for role, packet in native.calls:
+                self.assertNotIn("## CURRENT USER INSTRUCTIONS", packet, role)
+                self.assertIn(TEST_CORE, packet, role)
+            # A run that fails inside the graph also clears the binding.
+            with self.assertRaises(OraReviewError):
+                runner.run_gear3(RunRequest(
+                    material=UserMaterial(original=""),
+                    run_root=runs / "runs3"))
+            self.assertIsNone(runner.packet_builder.instruction_prefix)
+
+    def test_reused_runner_resolves_launch_instructions_per_run(self) -> None:
+        # Real resolution per launch: swapping the env-selected master between
+        # runs changes the core the second run carries; a broken selected
+        # master fails the launch before any call and clears the binding.
+        with tempfile.TemporaryDirectory() as root:
+            runs = Path(root)
+            master_one = runs / "master-one.md"
+            master_two = runs / "master-two.md"
+            _write_master_file(master_one, TEST_CORE)
+            _write_master_file(master_two, "CORE v2 — refreshed per launch.")
+            native = ScriptedAdapter({
+                "gear-3-initial-answer": [
+                    lambda p: _answer(p, "a"), lambda p: _answer(p, "b")],
+                "gear-3-review-1": [_review("PASS"), _review("PASS")],
+            })
+            runner = ReviewRunner(native=native)
+            with patch.dict(os.environ, {"ORA_INSTRUCTION_MASTER": str(master_one)}):
+                runner.run_gear3(RunRequest(
+                    material=UserMaterial(original="m"), run_root=runs / "r1"))
+                self.assertIn(TEST_CORE, native.calls[0][1])
+                native.calls.clear()
+                with patch.dict(
+                    os.environ, {"ORA_INSTRUCTION_MASTER": str(master_two)}
+                ):
+                    runner.run_gear3(RunRequest(
+                        material=UserMaterial(original="m"), run_root=runs / "r2"))
+                self.assertIn("CORE v2 — refreshed per launch.",
+                              native.calls[0][1])
+                self.assertNotIn(TEST_CORE, native.calls[0][1])
+            with patch.dict(
+                os.environ, {"ORA_INSTRUCTION_MASTER": str(runs / "missing.md")}
+            ):
+                with self.assertRaises(OraReviewError):
+                    runner.run_gear3(RunRequest(
+                        material=UserMaterial(original="m"),
+                        run_root=runs / "r3"))
+            self.assertIsNone(runner.packet_builder.instruction_prefix)
+
+    def test_global_master_resolution_chain(self) -> None:
+        # The real resolver chain, exercised against fixture files: an
+        # env-selected valid master loads its core and names itself in the
+        # record; a broken selected master fails closed before any call; the
+        # provisioned default path loads; an unconfigured launch proceeds
+        # without the core and discloses that.
+        def environment_without_master() -> dict[str, str]:
+            environment = dict(os.environ)
+            environment.pop("ORA_INSTRUCTION_MASTER", None)
+            return environment
+
+        with tempfile.TemporaryDirectory() as root:
+            root_path = Path(root)
+            master = root_path / "master.md"
+            _write_master_file(master, TEST_CORE)
+
+            def request(run_name: str, **kwargs) -> RunRequest:
+                return RunRequest(
+                    material=UserMaterial(original="m"),
+                    run_root=root_path / run_name, **kwargs)
+
+            # (a) env-selected valid master: the core loads, the packet leads
+            # with it, and the record carries the whole prefix verbatim with
+            # its provenance and digest.
+            native = ScriptedAdapter({
+                "gear-3-initial-answer": [lambda p: _answer(p, "core loads")],
+                "gear-3-review-1": [_review("PASS")],
+            })
+            runner = ReviewRunner(native=native)
+            with patch.dict(os.environ, {"ORA_INSTRUCTION_MASTER": str(master)}):
+                result = runner.run_gear3(request(
+                    "runs-env", current_turn_instructions=TEST_OVERRIDE))
+            self.assertEqual(result.status, "PASSED")
+            self.assertIn(TEST_CORE, native.calls[0][1])
+            packet = native.calls[0][1]
+            prefix = packet.split(
+                "# CONTROLLING ORA INSTRUCTIONS\n\n", 1
+            )[1].split("\n\n## UNIVERSAL LAWS", 1)[0]
+            run_text = Path(result.run_path).read_text(encoding="utf-8")
+            self.assertIn(f"Global instruction master: `{master}`", run_text)
+            self.assertIn("RESOLVED INSTRUCTION PREFIX — VERBATIM", run_text)
+            self.assertIn(f"SHA-256: `{sha256_text(prefix)}`", run_text)
+            self.assertEqual(_turn_body(run_text), TEST_OVERRIDE)
+
+            # (b) env-selected missing master, malformed master, and
+            # invalid-UTF-8 master: hard errors naming the path, before any
+            # adapter call.
+            for name, master_file, fragment, writer in (
+                ("missing", root_path / "missing-master.md", "Cannot read",
+                 None),
+                ("malformed", None, "marker pair",
+                 lambda p: p.write_text("no core markers here",
+                                        encoding="utf-8")),
+                ("invalid-utf8", None, "Cannot read",
+                 lambda p: p.write_bytes(
+                     b"<!-- ORA-CORE-BEGIN -->\n"
+                     b"\xff\xfe invalid utf-8 bytes \xff"
+                     b"<!-- ORA-CORE-END -->\n")),
+            ):
+                with self.subTest(master=name):
+                    if master_file is None:
+                        master_file = root_path / f"{name}-master.md"
+                        writer(master_file)
+                    failing = ScriptedAdapter({})
+                    runner = ReviewRunner(native=failing)
+                    with patch.dict(
+                        os.environ, {"ORA_INSTRUCTION_MASTER": str(master_file)}
+                    ):
+                        with self.assertRaises(OraReviewError) as raised:
+                            runner.run_gear3(request(f"runs-{name}"))
+                    message = str(raised.exception)
+                    self.assertIn(str(master_file), message)
+                    self.assertIn(fragment, message)
+                    self.assertIn("README", message)
+                    # The advice stays portable: apart from the fixture path
+                    # this test supplied, the message carries no absolute
+                    # home path and no machine-specific repair steps, so a
+                    # reintroduced private setup hint fails here.
+                    beyond_fixture = message.replace(str(master_file), "")
+                    self.assertNotIn("/Users/", beyond_fixture)
+                    self.assertNotIn("python3", beyond_fixture)
+                    self.assertNotIn("Regenerate", beyond_fixture)
+                    self.assertEqual(failing.calls, [])
+
+            # (c) the provisioned default path: with no env selection, the
+            # master at ~/.config/ora/global-instructions.md loads.
+            home = root_path / "home-default"
+            (home / ".config" / "ora").mkdir(parents=True)
+            _write_master_file(
+                home / ".config" / "ora" / "global-instructions.md", TEST_CORE)
+            native = ScriptedAdapter({
+                "gear-3-initial-answer": [lambda p: _answer(p, "default path")],
+                "gear-3-review-1": [_review("PASS")],
+            })
+            runner = ReviewRunner(native=native)
+            with (
+                patch.dict(
+                    os.environ, environment_without_master(), clear=True),
+                patch.object(Path, "home", return_value=home),
+            ):
+                result = runner.run_gear3(request("runs-default"))
+            self.assertEqual(result.status, "PASSED")
+            self.assertIn(TEST_CORE, native.calls[0][1])
+            run_text = Path(result.run_path).read_text(encoding="utf-8")
+            self.assertIn(
+                "Global instruction master: "
+                f"`{home / '.config' / 'ora' / 'global-instructions.md'}`",
+                run_text,
+            )
+
+            # (d) unconfigured: the run proceeds without the core, the
+            # disclosure notice surfaces, and the record notes it.
+            empty_home = root_path / "home-empty"
+            empty_home.mkdir()
+            native = ScriptedAdapter({
+                "gear-3-initial-answer": [lambda p: _answer(p, "no core")],
+                "gear-3-review-1": [_review("PASS")],
+            })
+            runner = ReviewRunner(native=native)
+            with (
+                patch.dict(
+                    os.environ, environment_without_master(), clear=True),
+                patch.object(Path, "home", return_value=empty_home),
+            ):
+                result = runner.run_gear3(request("runs-unconfigured"))
+            self.assertEqual(result.status, "PASSED")
+            self.assertIn(NO_MASTER_NOTICE, result.notices)
+            self.assertNotIn("## CORE RULES — UNIVERSAL", native.calls[0][1])
+            run_text = Path(result.run_path).read_text(encoding="utf-8")
+            self.assertIn(NO_MASTER_NOTICE, run_text)
+            self.assertIn("Global instruction master: `none`", run_text)
+            self.assertIn(
+                "No instruction prefix was bound for this run.", run_text)
+
+    def test_default_master_broken_entry_fails_closed(self) -> None:
+        # A directory or a dangling symlink at the documented default path
+        # is broken provisioned configuration, not an unconfigured launch:
+        # both are hard errors naming the path, before any adapter call.
+        environment = dict(os.environ)
+        environment.pop("ORA_INSTRUCTION_MASTER", None)
+
+        with tempfile.TemporaryDirectory() as root:
+            root_path = Path(root)
+
+            def fresh_home(name: str) -> Path:
+                home = root_path / name
+                (home / ".config" / "ora").mkdir(parents=True)
+                return home
+
+            cases = [
+                ("directory", fresh_home("home-dir"),
+                 lambda default: default.mkdir()),
+                ("dangling-symlink", fresh_home("home-link"),
+                 lambda default: default.symlink_to(
+                     root_path / "master-gone.md")),
+            ]
+            for name, home, break_default in cases:
+                with self.subTest(entry=name):
+                    default = home / ".config" / "ora" / "global-instructions.md"
+                    try:
+                        break_default(default)
+                    except (OSError, NotImplementedError) as failure:
+                        self.skipTest(f"entry unavailable: {failure}")
+                    failing = ScriptedAdapter({})
+                    runner = ReviewRunner(native=failing)
+                    with (
+                        patch.dict(os.environ, environment, clear=True),
+                        patch.object(Path, "home", return_value=home),
+                    ):
+                        with self.assertRaises(OraReviewError) as raised:
+                            runner.run_gear3(RunRequest(
+                                material=UserMaterial(original="m"),
+                                run_root=root_path / f"runs-{name}"))
+                    message = str(raised.exception)
+                    self.assertIn(str(default), message)
+                    self.assertIn("README", message)
+                    self.assertEqual(failing.calls, [])
+
+    def test_default_master_unsearchable_parent_fails_closed(self) -> None:
+        # A provisioned default master whose parent directory cannot be
+        # searched is inaccessible configuration, not absence: the launch
+        # stops with the master error naming the path and the README
+        # advice, before any adapter call. A probe that swallows
+        # PermissionError (lexists-style) would mistake this for no
+        # configuration and run without the core rules.
+        environment = dict(os.environ)
+        environment.pop("ORA_INSTRUCTION_MASTER", None)
+
+        with tempfile.TemporaryDirectory() as root:
+            root_path = Path(root)
+            home = root_path / "home-lock"
+            ora_dir = home / ".config" / "ora"
+            ora_dir.mkdir(parents=True)
+            default = ora_dir / "global-instructions.md"
+            _write_master_file(default, TEST_CORE)
+            try:
+                ora_dir.chmod(0o000)
+            except (OSError, NotImplementedError) as failure:
+                self.skipTest(f"permission state unavailable: {failure}")
+            try:
+                try:
+                    os.lstat(default)
+                except PermissionError:
+                    pass
+                else:
+                    self.skipTest(
+                        "the unsearchable-parent state did not take effect "
+                        "(root or platform ignores directory permissions)")
+                failing = ScriptedAdapter({})
+                runner = ReviewRunner(native=failing)
+                with (
+                    patch.dict(os.environ, environment, clear=True),
+                    patch.object(Path, "home", return_value=home),
+                ):
+                    with self.assertRaises(OraReviewError) as raised:
+                        runner.run_gear3(RunRequest(
+                            material=UserMaterial(original="m"),
+                            run_root=root_path / "runs-locked"))
+                message = str(raised.exception)
+                self.assertIn(str(default), message)
+                self.assertIn("README", message)
+                # The advice stays portable here too: beyond the fixture
+                # path, no absolute home path or machine-specific hint.
+                beyond_fixture = message.replace(str(default), "")
+                self.assertNotIn("/Users/", beyond_fixture)
+                self.assertEqual(failing.calls, [])
+            finally:
+                ora_dir.chmod(0o755)
+
+    def test_cli_reports_invalid_utf8_master_without_traceback(self) -> None:
+        # A master file with invalid UTF-8 reaches the user as the required
+        # message naming the path — never an unhandled traceback — and no
+        # adapter call happens.
+        with tempfile.TemporaryDirectory() as root:
+            root_path = Path(root)
+            bad_master = root_path / "bad-encoding-master.md"
+            bad_master.write_bytes(
+                b"<!-- ORA-CORE-BEGIN -->\n"
+                b"\xff\xfe invalid utf-8 bytes \xff"
+                b"<!-- ORA-CORE-END -->\n")
+            request_path = root_path / "request.md"
+            request_path.write_text(
+                "Review this exact answer.", encoding="utf-8")
+            calls: list[tuple[str, str]] = []
+
+            class RecordingCodex:
+                engine = "codex"
+
+                def call(self, packet: str, *, role: str) -> str:
+                    calls.append((role, packet))
+                    raise AssertionError("no adapter call may happen")
+
+            stdout = io.StringIO()
+            stderr = io.StringIO()
+            with (
+                patch.dict(
+                    os.environ,
+                    {"ORA_INSTRUCTION_MASTER": str(bad_master)}),
+                patch.object(cli_module, "CodexAdapter",
+                             return_value=RecordingCodex()),
+                patch.object(cli_module.sys, "stdout", stdout),
+                patch.object(cli_module.sys, "stderr", stderr),
+            ):
+                exit_code = cli_module._run("gear3", [
+                    "--request", str(request_path), "--native", "codex"])
+            self.assertEqual(exit_code, 1)
+            self.assertEqual(calls, [])
+            message = stderr.getvalue()
+            self.assertIn(str(bad_master), message)
+            self.assertIn("README", message)
+            self.assertNotIn("Traceback", message)
+
+    def test_loader_refusals_happen_before_any_call(self) -> None:
+        native = ScriptedAdapter({})
+        runner = ReviewRunner(native=native)
+        with tempfile.TemporaryDirectory() as root:
+            root_path = Path(root)
+            repo = self._repo(root_path)
+            outside = root_path / "outside.txt"
+            outside.write_text("outside", encoding="utf-8")
+            cycle = root_path / "cycle"
+            cycle.mkdir()
+            (cycle / "AGENTS.md").write_text(
+                "@loop.md\nCycle rules.", encoding="utf-8")
+            (cycle / "loop.md").write_text(
+                "@AGENTS.md\nLoop rules.", encoding="utf-8")
+            material = UserMaterial(original="m")
+            cases = {
+                "missing repository": {"repository_path": root_path / "nope"},
+                "assigned path outside the repository": {
+                    "repository_path": repo,
+                    "assigned_paths": (str(outside),)},
+                "blank assigned path": {
+                    "repository_path": repo, "assigned_paths": ("  ",)},
+                "assigned paths without a repository": {
+                    "assigned_paths": ("nested/AGENTS.md",)},
+                "cyclic instruction imports": {"repository_path": cycle},
+            }
+            for name, kwargs in cases.items():
+                with self.subTest(name):
+                    with self.assertRaises(OraReviewError):
+                        runner.run_gear3(RunRequest(
+                            material=material, run_root=root_path / "runs",
+                            **kwargs))
+        self.assertEqual(native.calls, [])
+
+    def test_cli_file_inputs_construct_the_request_only(self) -> None:
+        with tempfile.TemporaryDirectory() as root:
+            root_path = Path(root)
+            request = root_path / "request.txt"
+            request.write_text("Review this exact answer.", encoding="utf-8")
+            turn = root_path / "turn.txt"
+            turn.write_text(TEST_OVERRIDE, encoding="utf-8")
+            repo = self._repo(root_path)
+            captured: list[str] = []
+
+            class RecordingCodex:
+                engine = "codex"
+
+                def call(self, packet: str, *, role: str) -> str:
+                    captured.append(packet)
+                    if "review" in role:
+                        return _review("PASS")
+                    return _answer(packet, "cli answer")
+
+            with (
+                patch.object(cli_module, "CodexAdapter",
+                             return_value=RecordingCodex()),
+                patch.object(
+                    cli_module,
+                    "RunRequest",
+                    side_effect=lambda **kwargs: RunRequest(
+                        run_root=root_path / "runs", **kwargs
+                    ),
+                ),
+            ):
+                exit_code = cli_module._run("gear3", [
+                    "--request", str(request),
+                    "--turn-instructions-file", str(turn),
+                    "--repository", str(repo),
+                    "--assigned-path", "nested/AGENTS.md",
+                    "--native", "codex",
+                ])
+            self.assertEqual(exit_code, 0)
+            # The CLI run wrote its record inside the fixture, never under the
+            # real run-record root, and the RUN.md records the governing
+            # instruction prefix with the turn body verbatim inside it.
+            records = tuple((root_path / "runs").glob("*/RUN.md"))
+            self.assertEqual(len(records), 1)
+            run_text = records[0].read_text(encoding="utf-8")
+            self.assertIn("RESOLVED INSTRUCTION PREFIX — VERBATIM", run_text)
+            self.assertEqual(_turn_body(run_text), TEST_OVERRIDE)
+        self.assertTrue(captured)
+        for packet in captured:
+            self.assertIn("## CORE RULES — UNIVERSAL", packet)
+            self.assertEqual(_turn_body(packet), TEST_OVERRIDE)
+            self.assertIn("Rule: one file per change.", packet)
+            self.assertIn("NARROWER RULES — nested/AGENTS.md", packet)
+
 
 
 if __name__ == "__main__":

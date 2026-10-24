@@ -25,6 +25,19 @@ host limitation plainly instead of pretending the fidelity guarantee holds.
 - Add `--peer TARGET` only for the Agent Bridge target the user selected. Pass
   that ID unchanged; Bridge owns target validation. Never discover, rotate, or
   silently substitute another target.
+- Add `--repository PATH` with the absolute path of the repository or task
+  worktree the request works on — the real candidate worktree, not the
+  document folder, primary checkout, or temporary launch directory. Omit it
+  for non-repository work; never guess a repository from the request text.
+- Add `--assigned-path PATH` once per path the assignment actually works on
+  inside that repository — repository-relative or absolute, taken from the
+  assignment itself, never guessed from request text. Omit it for
+  whole-repository work.
+- Add `--turn-instructions-file FILE` when the current user message carries
+  instructions for this turn — for example an override naming a core rule
+  with its condition and scope. The file must hold the exact original
+  message, never a retyped or tidied copy. Omit the option when no current
+  user instruction exists.
 - Use `--current-answer FILE` when the caller wants an existing complete answer
   reviewed. Supply later user messages, assistant turns, or governing context
   only through their matching repeated file options and in the caller's order.

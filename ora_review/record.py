@@ -27,6 +27,8 @@ class RunRecord:
         route: str,
         material: UserMaterial,
         instruction_snapshot: Sequence[StageMaterial],
+        instruction_prefix: str | None = None,
+        instruction_prefix_provenance: str | None = None,
         run_root: Path | None = None,
         breadth: str | None = None,
         native_engine: str | None = None,
@@ -88,6 +90,27 @@ class RunRecord:
         if breadth is not None:
             config_lines.append(f"Breadth: `{breadth}`")
         config_lines.extend(["", "## Instruction snapshot", ""])
+        if instruction_prefix_provenance is not None:
+            config_lines.append(
+                f"Global instruction master: `{instruction_prefix_provenance}`"
+            )
+            if instruction_prefix is not None:
+                config_lines.append("")
+                config_lines.append(
+                    builder.protect(
+                        "RESOLVED INSTRUCTION PREFIX — VERBATIM",
+                        instruction_prefix,
+                        collision_bodies=[
+                            *material_bodies,
+                            instruction_prefix,
+                            *(x.body for x in instruction_snapshot),
+                        ],
+                    ).render(heading_level=3)
+                )
+                config_lines.append("")
+            else:
+                config_lines.append("No instruction prefix was bound for this run.")
+                config_lines.append("")
         snapshots = []
         for item in instruction_snapshot:
             snapshots.append(
