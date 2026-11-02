@@ -1,6 +1,6 @@
 ---
 name: ora-gear-4
-description: Run standalone Ora Gear 4 on an exact request, using Codex by default or an explicitly selected native engine, analytical or committed Breadth, and optional consensus.
+description: Run standalone Ora Gear 4 on an exact request, using Codex by default or an explicitly selected native engine, with analytical or committed Breadth.
 ---
 
 # Ora Gear 4
@@ -12,13 +12,12 @@ The command's verbatim-input law is load-bearing. Invoke it only when the exact
 original request is available through a caller-supplied local file or through
 standard input that the caller supplied directly. Never reconstruct, tidy,
 summarize, or retype the current chat message into a temporary file and call
-that “verbatim.” If there is no exact machine-readable source, explain this
+that "verbatim." If there is no exact machine-readable source, explain this
 host limitation plainly instead of pretending the fidelity guarantee holds.
 
-- Analytical Breadth and one-pass are the defaults. Add `--breadth committed`
-  only when the user explicitly selects it, and supply the separate exact
-  user-written commitment with `--commitment FILE`.
-- Add `--consensus` only when the user asks for it.
+- Analytical Breadth is the default. Add `--breadth committed` only when the
+  user explicitly selects it, and supply the separate exact user-written
+  commitment with `--commitment FILE`.
 - Omit `--native` or use `--native codex` for the compatible Codex default. Pass
   the caller's explicit engine choice through unchanged — `--native claude`, or
   `--native zcode`/`hermes`/`qwen`/`minimax` for a fresh analytical route through
@@ -32,10 +31,6 @@ host limitation plainly instead of pretending the fidelity guarantee holds.
   worktree the request works on — the real candidate worktree, not the
   document folder, primary checkout, or temporary launch directory. Omit it
   for non-repository work; never guess a repository from the request text.
-- Add `--assigned-path PATH` once per path the assignment actually works on
-  inside that repository — repository-relative or absolute, taken from the
-  assignment itself, never guessed from request text. Omit it for
-  whole-repository work.
 - Add `--turn-instructions-file FILE` when the current user message carries
   instructions for this turn — for example an override naming a core rule
   with its condition and scope. The file must hold the exact original
