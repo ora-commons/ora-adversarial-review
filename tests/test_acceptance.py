@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import hashlib
 import io
 import json
 import os
@@ -16,48 +15,51 @@ from pathlib import Path
 from unittest.mock import patch
 
 import ora_review.cli as cli_module
-from ora_review import ANALYTICAL_ENGINES, COMPONENT_FACTS, VERSION
-from ora_review import adapters as adapters_module
 from ora_review.adapters import (
+    _ProcessResult,
     BridgeAdapter,
     ClaudeAdapter,
     CodexAdapter,
-    _BridgeCommand,
-    _ProcessResult,
 )
 from ora_review.errors import CallFailure, MalformedResponse, OraReviewError
-from ora_review.models import AnswerBoundary, StageMaterial, UserMaterial
-from ora_review.packet import (
-    NO_MASTER_NOTICE,
-    PacketBuilder,
-    extract_answer,
-    sha256_text,
-)
+from ora_review.models import StageMaterial, UserMaterial
+from ora_review.packet import NO_MASTER_NOTICE, PacketBuilder, extract_answer
 from ora_review.runner import ReviewRunner, RunRequest
-from ora_review.validator import (
-    ValidationRequest,
-    ValidationRunner,
-    parse_root_decisions,
-)
 
 
-def _answer(packet: str, body: str, *, revision: bool = False) -> str:
+def _answer(
+    packet: str,
+    body: str,
+    *,
+    revision: bool = False,
+    revision_disposition: str = "SETTLED",
+    revision_items: str = "- R1 — ACCEPTED — corrected.",
+) -> str:
     begins = re.findall(r"<<<ORA-ANSWER-BEGIN:[^\n>]+>>>", packet)
     ends = re.findall(r"<<<ORA-ANSWER-END:[^\n>]+>>>", packet)
     if not begins or not ends:
         raise AssertionError("scripted answer did not receive an output boundary pair")
-    begin = begins[-1]
-    end = ends[-1]
-    disposition = "## REVIEW DISPOSITION\n\n- R1 — ACCEPTED — corrected.\n\n" if revision else ""
-    return f"{disposition}{begin}\n{body}\n{end}"
+    disposition = (
+        f"## REVIEW DISPOSITION\n\n{revision_items}\n\n" if revision else ""
+    )
+    text = f"{disposition}{begins[-1]}\n{body}\n{ends[-1]}"
+    if revision:
+        text += f"\n\nReview disposition: {revision_disposition}"
+    return text
 
 
-def _review(verdict: str, finding: str = "None.") -> str:
+def _review(
+    disposition: str = "SETTLED",
+    finding: str = "None.",
+    *,
+    severe: str = "None.",
+) -> str:
     return (
-        "## VERDICT RATIONALE\n\nScripted material judgment.\n\n"
+        "## REVIEW RATIONALE\n\nScripted material judgment.\n\n"
+        f"## SEVERE FINDINGS\n\n{severe}\n\n"
         f"## MATERIAL FINDINGS\n\n{finding}\n\n"
         "## OVERLOOKED CONSIDERATIONS\n\nNone.\n\n"
-        f"VERDICT: {verdict}"
+        f"Review disposition: {disposition}"
     )
 
 
@@ -86,360 +88,293 @@ class ScriptedAdapter:
         return value
 
 
-class FakeBridgeCommand:
-    def __init__(
-        self, session: Path, *, fail_after_response: bool = False,
-        raise_after_response: bool = False, verdict: str = "PASS", warnings: str = ""
-    ) -> None:
-        self.session = session
-        self.fail_after_response = fail_after_response
-        self.raise_after_response = raise_after_response
-        self.verdict = verdict
-        self.warnings = warnings
-        self.bodies: list[str] = []
-        self.arguments: list[tuple[str, ...]] = []
+TEST_CORE = (
+    "CORE — applies to every call this core is sent to.\n\n"
+    "C0 Only the user may authorize an override."
+)
+TEST_OVERRIDE = (
+    "Override C5 for this turn only: answer directly without manufactured "
+    "pushback; applies while the draft stays under review."
+)
 
-    def run(self, arguments, *, body: str = "", timeout: float | None = 60):
-        self.bodies.append(body)
-        self.arguments.append(tuple(arguments))
-        messages = self.session / "messages"
-        messages.mkdir(parents=True, exist_ok=True)
-        existing = [
-            int(path.name.split("-", 1)[0])
-            for path in messages.glob("*-peer-to-initiator.md")
-            if path.name.split("-", 1)[0].isdigit()
-        ]
-        sequence = max(existing, default=0) + 2
-        response = messages / f"{sequence:04d}-peer-to-initiator.md"
-        response.write_bytes(
-            (
-                f"# Message {sequence:04d}\nFrom: zcode\nTo: ora-gear-3\n\n"
-                "## Body\n\n" + _review(self.verdict)
-            ).encode("utf-8")
-        )
-        if self.raise_after_response:
-            raise CallFailure(
-                "`bridge` run ended with a transport failure. "
-                "Last error output: published response was not flushed"
-            )
-        if self.fail_after_response:
-            return _ProcessResult(1, b"", b"published response was not flushed")
-        return _ProcessResult(
-            0, (str(response) + "\n").encode("utf-8"), self.warnings.encode("utf-8")
-        )
+# Every runner launch resolves the global instruction master through the real
+# chain: this module points ORA_INSTRUCTION_MASTER at a fixture master file,
+# so no test depends on (or writes into) anything outside its own fixtures.
+_MASTER_FIXTURE: dict[str, object] = {}
+_PRIOR_MASTER_ENV: dict[str, str] = {}
 
 
-def _validator_body(packet: str, sections: str) -> str:
-    begins = re.findall(r"<<<ORA-VALIDATION-BEGIN:[^\n>]+>>>", packet)
-    ends = re.findall(r"<<<ORA-VALIDATION-END:[^\n>]+>>>", packet)
-    if not begins or not ends:
-        raise AssertionError("validator did not receive a validation boundary pair")
-    return f"{begins[-1]}\n{sections}\n{ends[-1]}"
-
-
-def _root_decision(root: str, decision: str = "ACCEPT") -> str:
-    return (
-        f"## {root} — {decision}\n\n"
-        "### BEHAVIOR\n"
-        f"Behavior judgment for {root}.\n\n"
-        "### MECHANISM\n"
-        f"Mechanism judgment for {root}.\n\n"
-        "### EVIDENCE\n"
-        f"Evidence inspected for {root}.\n\n"
-        "### LIMITATIONS\n"
-        "None identified."
-    )
-
-
-def _write_validator_session(session: Path, peer: str = "zcode") -> None:
-    session.mkdir(parents=True, exist_ok=True)
-    (session / "messages").mkdir(exist_ok=True)
-    (session / "SESSION.md").write_text(
-        "# Session\n\n"
-        "Bridge-Format: 2\n"
-        "Initiator: ora-validator\n"
-        f"Peer: {peer}\n\n"
-        "## Body\n\n"
-        "Synthetic validator transport session.\n",
+def _write_master_file(path: Path, core: str) -> None:
+    path.write_text(
+        f"<!-- ORA-CORE-BEGIN -->\n{core}\n<!-- ORA-CORE-END -->\n",
         encoding="utf-8",
     )
 
 
-class ValidatorBridgeCommand:
-    def __init__(
-        self,
-        session: Path,
-        response_factory,
-        *,
-        returncode: int = 0,
-        header_factory=None,
-        extra_response: bool = False,
-        warnings: str = "",
-    ) -> None:
-        self.session = session
-        self.response_factory = response_factory
-        self.returncode = returncode
-        self.header_factory = header_factory
-        self.extra_response = extra_response
-        self.warnings = warnings
-        self.bodies: list[str] = []
+def setUpModule() -> None:
+    directory = Path(tempfile.mkdtemp(prefix="ora-master-fixture-"))
+    master = directory / "global-instructions.md"
+    _write_master_file(master, TEST_CORE)
+    _MASTER_FIXTURE["directory"] = directory
+    _MASTER_FIXTURE["master"] = master
+    if "ORA_INSTRUCTION_MASTER" in os.environ:
+        _PRIOR_MASTER_ENV["ORA_INSTRUCTION_MASTER"] = os.environ[
+            "ORA_INSTRUCTION_MASTER"
+        ]
+    os.environ["ORA_INSTRUCTION_MASTER"] = str(master)
 
-    def run(self, arguments, *, body: str = "", timeout: float = 60):
-        self.bodies.append(body)
-        messages = self.session / "messages"
-        messages.mkdir(parents=True, exist_ok=True)
-        response = messages / "0002-peer-to-initiator.md"
-        header = (
-            self.header_factory("0002")
-            if self.header_factory is not None
-            else "# Message 0002\nFrom: zcode\nTo: ora-validator"
+
+def tearDownModule() -> None:
+    if "ORA_INSTRUCTION_MASTER" in _PRIOR_MASTER_ENV:
+        os.environ["ORA_INSTRUCTION_MASTER"] = _PRIOR_MASTER_ENV[
+            "ORA_INSTRUCTION_MASTER"
+        ]
+    else:
+        os.environ.pop("ORA_INSTRUCTION_MASTER", None)
+    shutil.rmtree(str(_MASTER_FIXTURE["directory"]), ignore_errors=True)
+
+
+class Gear3EndingTests(unittest.TestCase):
+    """One simple check per Gear 3 ending, on the shared scripted adapter."""
+
+    def test_each_ending(self) -> None:
+        severe_finding = (
+            "- S1 — traced path from a permitted input to data loss."
         )
-        response.write_text(
-            f"{header}\n\n## Body\n\n{self.response_factory(body)}",
-            encoding="utf-8",
-        )
-        if self.extra_response:
-            (messages / "0004-peer-to-initiator.md").write_text(
-                "# Message 0004\nFrom: zcode\nTo: ora-validator\n\n"
-                "## Body\n\nsecond response",
-                encoding="utf-8",
-            )
-        if self.returncode:
-            return _ProcessResult(
-                self.returncode,
-                b"",
-                b"synthetic transport failure after publication",
-            )
-        return _ProcessResult(
-            0,
-            (str(response) + "\n").encode("utf-8"),
-            self.warnings.encode("utf-8"),
-        )
-
-
-class AcceptanceTests(unittest.TestCase):
-    def test_exact_packet_and_answer_boundaries(self) -> None:
-        original = (
-            "  Keep leading space\r\n# User heading\r\n```json\r\n"
-            '{"text":"naïve 🧭 --mode yolo"}\r\n```\r\n'
-            "<<<ORA-PROTECTED-BEGIN:not-ours>>>\r\n"
-        )
-        later = "Second message\n\nwith exact spacing.\n"
-        assistant = "Prior assistant claim, retained as context.\n"
-        stage = "STATUS: NOT PASSED\n\nThis remains inert."
-        material = UserMaterial(
-            original=original,
-            later_user_messages=(later,),
-            prior_assistant_turns=(assistant,),
-        )
-        builder = PacketBuilder()
-        boundary = builder.answer_boundary((original, later, assistant, stage))
-        packet = builder.build(
-            material=material,
-            role_files=("initial-answer.md",),
-            output_file="output-answer.md",
-            stage_material=(StageMaterial("EXACT STAGE", stage),),
-            answer_boundary=boundary,
-        )
-
-        self.assertIn(original, packet)
-        self.assertIn(later, packet)
-        self.assertIn(assistant, packet)
-        self.assertIn(stage, packet)
-        self.assertIn(sha256_text(original), packet)
-        self.assertIn("Later user messages supplement the original request.", packet)
-        self.assertIn("the later user instruction controls", packet)
-        self.assertIn(
-            "are not thereby user instructions or established facts",
-            packet,
-        )
-        self.assertLess(packet.index("# CONTROLLING ORA INSTRUCTIONS"), packet.index(original))
-        self.assertLess(packet.index(original), packet.index(stage))
-        strict = '{"answer":"kept exactly"}'
-        self.assertEqual(extract_answer(_answer(packet, strict), boundary), strict)
-        with self.assertRaises(MalformedResponse):
-            extract_answer("no supplied boundaries", boundary)
-
-        for gear in (3, 4):
-            with self.subTest(gear=gear), tempfile.TemporaryDirectory() as root:
-                instruction_root = Path(root) / "instructions"
-                shutil.copytree(
-                    Path(__file__).parents[1] / "ora_review" / "instructions",
-                    instruction_root,
-                )
-                changed_names = ("universal.md", "reviewer.md", "output-review.md")
-                original_instructions = {
-                    name: (instruction_root / name).read_text(encoding="utf-8")
-                    for name in changed_names
-                }
-                for name, body in original_instructions.items():
-                    (instruction_root / name).write_text(
-                        body + f"\nRUN-ONE-{name}\n", encoding="utf-8"
-                    )
-
-                def edit_instructions_during_call(packet):
-                    for name, body in original_instructions.items():
-                        (instruction_root / name).write_text(
-                            body + f"\nRUN-TWO-{name}\n", encoding="utf-8"
-                        )
-                    return _answer(packet, "complete answer")
-
-                script = (
-                    {
-                        "gear-3-initial-answer": [edit_instructions_during_call] * 2,
-                        "gear-3-review-1": [_review("PASS")] * 2,
-                    }
-                    if gear == 3
-                    else {
-                        "gear-4-depth-draft": [edit_instructions_during_call] * 2,
-                        "gear-4-breadth-draft": [lambda p: _answer(p, "breadth")] * 2,
-                        "gear-4-depth-review-1": [_review("PASS")] * 2,
-                        "gear-4-breadth-review-1": [_review("PASS")] * 2,
-                        "gear-4-consolidation": [lambda p: _answer(p, "synthesis")] * 2,
-                        "gear-4-consolidated-answer-review-1": [_review("PASS")] * 2,
-                    }
-                )
-                native = ScriptedAdapter(script)
-                runner = ReviewRunner(native)
-                with patch("ora_review.packet.files", return_value=Path(root)):
-                    for version, other in (("ONE", "TWO"), ("TWO", "ONE")):
-                        first_call = len(native.calls)
-                        result = getattr(runner, f"run_gear{gear}")(
-                            RunRequest(material=material, run_root=Path(root) / "runs")
-                        )
-                        self.assertEqual(result.status, "PASSED")
-                        run_text = Path(result.run_path).read_text(encoding="utf-8")
-                        for name, body in original_instructions.items():
-                            self.assertIn(body + f"\nRUN-{version}-{name}\n", run_text)
-                            self.assertNotIn(f"RUN-{other}-{name}", run_text)
-                        for role, role_packet in native.calls[first_call:]:
-                            names = changed_names if "-review-" in role else ("universal.md",)
-                            for name in names:
-                                self.assertIn(f"RUN-{version}-{name}", role_packet)
-                                self.assertNotIn(f"RUN-{other}-{name}", role_packet)
-
-    def test_gear3_fixed_outcomes(self) -> None:
         cases = (
             (
-                "pass-unchanged",
-                False,
-                {"gear-3-review-1": [_review("PASS")]},
-                {},
+                "settled-review-passes",
+                {"gear-3-review-1": [_review("SETTLED")]},
                 "original answer",
                 "PASSED",
                 False,
                 1,
-                0,
             ),
             (
-                "one-pass-revision",
+                "settled-correction",
+                {
+                    "gear-3-review-1": [_review("CORRECTION", "- R1 — material defect.")],
+                    "gear-3-revision-1": [
+                        lambda packet: _answer(packet, "revised", revision=True)
+                    ],
+                },
+                "revised",
+                "SETTLED AFTER CORRECTION — REVISED, NOT RE-REVIEWED",
                 False,
+                2,
+            ),
+            (
+                "settled-rejection-keeps-answer",
+                {
+                    "gear-3-review-1": [_review("CORRECTION", "- R1 — not a defect.")],
+                    "gear-3-revision-1": [
+                        lambda packet: _answer(
+                            packet,
+                            "original answer",
+                            revision=True,
+                            revision_items=(
+                                "- R1 — DECLINED — the claim lacks support; no change."
+                            ),
+                        )
+                    ],
+                },
+                "original answer",
+                "SETTLED AFTER CORRECTION — REVISED, NOT RE-REVIEWED",
+                False,
+                2,
+            ),
+            (
+                "severe-fix-settles",
                 {
                     "gear-3-review-1": [
-                        _review("FAIL", "- R1 — material defect. Suggest: fix. Why: truth.")
+                        _review("CORRECTION", "- R1 — material.", severe=severe_finding)
+                    ],
+                    "gear-3-revision-1": [
+                        lambda packet: _answer(
+                            packet,
+                            "revised",
+                            revision=True,
+                            revision_items=(
+                                "- R1 — ACCEPTED — corrected.\n"
+                                "- S1 — ACCEPTED — removed the harmful path; "
+                                "the traced input no longer reaches it."
+                            ),
+                        )
+                    ],
+                },
+                "revised",
+                "SETTLED AFTER CORRECTION — REVISED, NOT RE-REVIEWED",
+                False,
+                2,
+            ),
+            (
+                "severe-review-goes-to-owner",
+                {
+                    "gear-3-review-1": [
+                        _review("SEVERE", "- R1 — adjacent.", severe=severe_finding)
                     ]
                 },
-                {"gear-3-revision-1": [lambda packet: _answer(packet, "revised", revision=True)]},
+                "original answer",
+                "SEVERE — UNRESOLVED, OWNER DECISION REQUIRED",
+                False,
+                1,
+            ),
+            (
+                "severe-revision-never-succeeds",
+                {
+                    "gear-3-review-1": [
+                        _review("CORRECTION", "- R1 — material.", severe=severe_finding)
+                    ],
+                    "gear-3-revision-1": [
+                        lambda packet: _answer(
+                            packet, "revised", revision=True, revision_disposition="SEVERE"
+                        )
+                    ],
+                },
                 "revised",
-                "ONE PASS COMPLETE — REVISED, NOT RE-REVIEWED",
+                "SEVERE — UNRESOLVED, OWNER DECISION REQUIRED",
                 False,
-                1,
-                1,
-            ),
-            (
-                "consensus-pass",
-                True,
-                {
-                    "gear-3-review-1": [_review("FAIL", "- R1 — first.")],
-                    "gear-3-review-2": [_review("FAIL", "- R2 — second.")],
-                    "gear-3-review-3": [_review("PASS")],
-                },
-                {
-                    "gear-3-revision-1": [lambda packet: _answer(packet, "revision one", revision=True)],
-                    "gear-3-revision-2": [lambda packet: _answer(packet, "revision two", revision=True)],
-                },
-                "revision two",
-                "PASSED",
-                False,
-                3,
                 2,
             ),
             (
-                "consensus-cap",
-                True,
+                "ask-user-review",
                 {
-                    "gear-3-review-1": [_review("FAIL", "- R1 — first.")],
-                    "gear-3-review-2": [_review("FAIL", "- R2 — second.")],
-                    "gear-3-review-3": [_review("FAIL", "- R3 — unresolved.")],
+                    "gear-3-review-1": [
+                        _review("ASK USER", "- R1 — needs a product choice.")
+                    ]
                 },
-                {
-                    "gear-3-revision-1": [lambda packet: _answer(packet, "revision one", revision=True)],
-                    "gear-3-revision-2": [lambda packet: _answer(packet, "revision two", revision=True)],
-                },
-                "revision two",
-                "NOT PASSED",
+                "original answer",
+                "ASK USER — OWNER DECISION REQUIRED",
                 False,
-                3,
-                2,
+                1,
             ),
             (
                 "review-incomplete",
-                False,
-                {"gear-3-review-1": [CallFailure("peer unavailable")]},
-                {"gear-3-review-1": [CallFailure("native recovery unavailable")]},
+                {
+                    "gear-3-review-1": [
+                        CallFailure("native failure"),
+                        CallFailure("native recovery failure"),
+                    ]
+                },
                 "original answer",
                 "NOT PASSED — REVIEW INCOMPLETE",
                 True,
-                1,
-                1,
+                2,
+            ),
+            (
+                "review-missing-disposition-is-incomplete",
+                {
+                    "gear-3-review-1": [
+                        "## REVIEW RATIONALE\n\nIncomplete scripted review.",
+                        CallFailure("native recovery failure"),
+                    ]
+                },
+                "original answer",
+                "NOT PASSED — REVIEW INCOMPLETE",
+                True,
+                2,
+            ),
+            (
+                "duplicate-disposition-is-incomplete",
+                {
+                    "gear-3-review-1": [
+                        "## REVIEW RATIONALE\n\nTwo declaration lines.\n\n"
+                        "Review disposition: SETTLED\n\n"
+                        "Review disposition: MAYBE",
+                        CallFailure("native recovery failure"),
+                    ]
+                },
+                "original answer",
+                "NOT PASSED — REVIEW INCOMPLETE",
+                True,
+                2,
             ),
             (
                 "revision-incomplete",
-                False,
-                {"gear-3-review-1": [_review("FAIL", "- R1 — material.")]},
                 {
+                    "gear-3-review-1": [_review("CORRECTION", "- R1 — material.")],
                     "gear-3-revision-1": [
                         CallFailure("first native failure"),
                         CallFailure("recovery failure"),
-                    ]
+                    ],
                 },
                 "original answer",
                 "NOT PASSED — REVISION INCOMPLETE",
                 True,
-                1,
-                2,
+                3,
+            ),
+            (
+                "settled-without-the-severe-fix-is-incomplete",
+                {
+                    "gear-3-review-1": [
+                        _review("CORRECTION", "- R1 — material.", severe=severe_finding)
+                    ],
+                    "gear-3-revision-1": [
+                        lambda packet: _answer(
+                            packet, "revised", revision=True, revision_items="None."
+                        ),
+                        CallFailure("recovery failure"),
+                    ],
+                },
+                "original answer",
+                "NOT PASSED — REVISION INCOMPLETE",
+                True,
+                3,
+            ),
+            (
+                "answer-text-severe-line-does-not-settle",
+                # An S-label line inside the answer body is answer content,
+                # not the severe finding's own recorded fix in the
+                # correction's REVIEW DISPOSITION section.
+                {
+                    "gear-3-review-1": [
+                        _review("CORRECTION", "- R1 — material.", severe=severe_finding)
+                    ],
+                    "gear-3-revision-1": [
+                        lambda packet: (
+                            "## REVIEW DISPOSITION\n\nNone.\n\n"
+                            "## COMPLETE CURRENT ANSWER\n"
+                            + _answer(
+                                packet,
+                                "- S1 — the unresolved issue in the original review.",
+                            )
+                            + "\n\nReview disposition: SETTLED"
+                        ),
+                        CallFailure("recovery failure"),
+                    ],
+                },
+                "original answer",
+                "NOT PASSED — REVISION INCOMPLETE",
+                True,
+                3,
             ),
         )
-
-        for (
-            name,
-            consensus,
-            peer_script,
-            native_script,
-            answer,
-            status,
-            incomplete,
-            peer_calls,
-            native_calls,
-        ) in cases:
+        for name, script, answer, status, incomplete, calls in cases:
             with self.subTest(name=name), tempfile.TemporaryDirectory() as root:
-                peer = ScriptedAdapter(peer_script)
-                native = ScriptedAdapter(native_script)
-                result = ReviewRunner(native, peer).run_gear3(
+                native = ScriptedAdapter(script)
+                result = ReviewRunner(native).run_gear3(
                     RunRequest(
                         material=UserMaterial("exact request"),
                         existing_answer="original answer",
-                        consensus=consensus,
                         run_root=Path(root),
                     )
                 )
                 self.assertEqual(result.answer, answer)
                 self.assertEqual(result.status, status)
                 self.assertEqual(result.technical_incomplete, incomplete)
-                self.assertEqual(len(peer.calls), peer_calls)
-                self.assertEqual(len(native.calls), native_calls)
-                self.assertTrue(Path(result.run_path).is_file())
+                self.assertEqual(
+                    result.exit_code,
+                    1 if incomplete or result.status.startswith("SEVERE") else 0,
+                )
+                self.assertEqual(len(native.calls), calls)
+                run_text = Path(result.run_path).read_text(encoding="utf-8")
+                self.assertIn(f"Status: **{status}**", run_text)
+                if name == "settled-without-the-severe-fix-is-incomplete":
+                    # The reviewer's severe finding survives the failed
+                    # correction in the record.
+                    self.assertIn("S1 — traced path", run_text)
 
+    def test_initial_answer_failure_leaves_record_only(self) -> None:
         with tempfile.TemporaryDirectory() as root:
             native = ScriptedAdapter(
                 {
@@ -451,10 +386,7 @@ class AcceptanceTests(unittest.TestCase):
             )
             with self.assertRaises(CallFailure) as raised:
                 ReviewRunner(native).run_gear3(
-                    RunRequest(
-                        material=UserMaterial("request"),
-                        run_root=Path(root),
-                    )
+                    RunRequest(material=UserMaterial("request"), run_root=Path(root))
                 )
             self.assertIn("incomplete run record", raised.exception.display())
             records = tuple(Path(root).glob("*/RUN.md"))
@@ -464,30 +396,55 @@ class AcceptanceTests(unittest.TestCase):
                 records[0].read_text(encoding="utf-8"),
             )
 
-    def test_gear4_complete_graph_consensus_and_fallback(self) -> None:
+    def test_peer_failure_switches_to_internal(self) -> None:
         with tempfile.TemporaryDirectory() as root:
             native = ScriptedAdapter(
                 {
-                    "gear-4-depth-draft": [lambda packet: _answer(packet, "DEPTH-ORIGINAL")],
+                    "gear-3-initial-answer": [lambda p: _answer(p, "first answer")],
+                    "gear-3-review-1": [_review("SETTLED")],
+                }
+            )
+            peer = ScriptedAdapter(
+                {"gear-3-review-1": [CallFailure("peer unavailable")]}
+            )
+            result = ReviewRunner(native, peer).run_gear3(
+                RunRequest(material=UserMaterial("request"), run_root=Path(root))
+            )
+            self.assertEqual(result.status, "PASSED")
+            self.assertEqual(len(peer.calls), 1)
+            self.assertEqual([role for role, _ in native.calls], ["gear-3-initial-answer", "gear-3-review-1"])
+            self.assertTrue(any(
+                "Route changed to internal".lower() in notice.lower()
+                or "Remaining peer-owned roles" in notice
+                for notice in result.notices
+            ))
+
+
+class Gear4GraphTests(unittest.TestCase):
+    def test_complete_graph_blindness_and_ownership(self) -> None:
+        with tempfile.TemporaryDirectory() as root:
+            native = ScriptedAdapter(
+                {
+                    "gear-4-depth-draft": [lambda p: _answer(p, "DEPTH-ORIGINAL")],
                     "gear-4-depth-revision-1": [
-                        lambda packet: _answer(packet, "DEPTH-CURRENT", revision=True)
+                        lambda p: _answer(p, "DEPTH-CURRENT", revision=True)
                     ],
-                    "gear-4-breadth-review-1": [_review("PASS")],
-                    "gear-4-consolidation": [lambda packet: _answer(packet, "SYNTHESIS")],
+                    "gear-4-breadth-review-1": [_review("SETTLED")],
+                    "gear-4-consolidation": [lambda p: _answer(p, "SYNTHESIS")],
                     "gear-4-consolidated-answer-revision-1": [
-                        lambda packet: _answer(packet, "FINAL-ANSWER", revision=True)
+                        lambda p: _answer(p, "FINAL-ANSWER", revision=True)
                     ],
                 },
                 engine="claude",
             )
             peer = ScriptedAdapter(
                 {
-                    "gear-4-breadth-draft": [lambda packet: _answer(packet, "BREADTH-ORIGINAL")],
+                    "gear-4-breadth-draft": [lambda p: _answer(p, "BREADTH-ORIGINAL")],
                     "gear-4-depth-review-1": [
-                        _review("FAIL", "- R1 — missed alternative. Suggest: add it. Why: material.")
+                        _review("CORRECTION", "- R1 — missed alternative.")
                     ],
                     "gear-4-consolidated-answer-review-1": [
-                        _review("FAIL", "- R1 — synthesis omission. Suggest: restore it. Why: material.")
+                        _review("CORRECTION", "- R1 — synthesis omission.")
                     ],
                 }
             )
@@ -496,13 +453,9 @@ class AcceptanceTests(unittest.TestCase):
             )
             self.assertEqual(result.answer, "FINAL-ANSWER")
             self.assertEqual(
-                result.status, "ONE PASS COMPLETE — REVISED, NOT RE-REVIEWED"
+                result.status, "SETTLED AFTER CORRECTION — REVISED, NOT RE-REVIEWED"
             )
             self.assertFalse(result.technical_incomplete)
-            self.assertIn(
-                "Native engine: `claude`",
-                Path(result.run_path).read_text(encoding="utf-8"),
-            )
             self.assertEqual(
                 [role for role, _ in native.calls],
                 [
@@ -522,59 +475,66 @@ class AcceptanceTests(unittest.TestCase):
                 ],
             )
             packets = dict(native.calls + peer.calls)
+            # Blind lanes: neither draft sees the other lane.
             self.assertNotIn("DEPTH-ORIGINAL", packets["gear-4-breadth-draft"])
             self.assertNotIn("BREADTH-ORIGINAL", packets["gear-4-depth-draft"])
+            # Reciprocal review sees only its own lane.
             self.assertIn("DEPTH-ORIGINAL", packets["gear-4-depth-review-1"])
             self.assertNotIn("BREADTH-ORIGINAL", packets["gear-4-depth-review-1"])
             self.assertIn("BREADTH-ORIGINAL", packets["gear-4-breadth-review-1"])
             self.assertNotIn("DEPTH-ORIGINAL", packets["gear-4-breadth-review-1"])
+            # Consolidation sees both current lanes, and the final review
+            # sees the synthesis and the lane record.
             self.assertIn("DEPTH-CURRENT", packets["gear-4-consolidation"])
             self.assertIn("BREADTH-ORIGINAL", packets["gear-4-consolidation"])
             self.assertIn("SYNTHESIS", packets["gear-4-consolidated-answer-review-1"])
+            self.assertIn("DEPTH LANE QUALITY STATUS", packets["gear-4-consolidation"])
+            self.assertIn(
+                "REVISED — SETTLED, NOT RE-REVIEWED", packets["gear-4-consolidation"]
+            )
 
+    def test_severe_lane_never_reports_success(self) -> None:
+        # A lane that ended severe never had a revision, so nothing recorded
+        # a fix for its severe finding: even a passing consolidated review
+        # cannot settle it.
         with tempfile.TemporaryDirectory() as root:
             native = ScriptedAdapter(
                 {
-                    "gear-4-depth-draft": [lambda packet: _answer(packet, "D0")],
-                    "gear-4-depth-revision-1": [lambda packet: _answer(packet, "D1", revision=True)],
-                    "gear-4-depth-revision-2": [lambda packet: _answer(packet, "D2", revision=True)],
-                    "gear-4-breadth-review-1": [_review("PASS")],
-                    "gear-4-consolidation": [lambda packet: _answer(packet, "C")],
+                    "gear-4-depth-draft": [lambda p: _answer(p, "D")],
+                    "gear-4-breadth-review-1": [_review("SETTLED")],
+                    "gear-4-consolidation": [lambda p: _answer(p, "C")],
                 },
                 engine="claude",
             )
             peer = ScriptedAdapter(
                 {
-                    "gear-4-breadth-draft": [lambda packet: _answer(packet, "B")],
-                    "gear-4-depth-review-1": [_review("FAIL", "- R1 — first.")],
-                    "gear-4-depth-review-2": [_review("FAIL", "- R2 — second.")],
-                    "gear-4-depth-review-3": [_review("FAIL", "- R3 — unresolved.")],
-                    "gear-4-consolidated-answer-review-1": [_review("PASS")],
+                    "gear-4-breadth-draft": [lambda p: _answer(p, "B")],
+                    "gear-4-depth-review-1": [
+                        _review(
+                            "SEVERE",
+                            "- R1 — adjacent defect.",
+                            severe="- S1 — traced path from a permitted input to data loss.",
+                        )
+                    ],
+                    "gear-4-consolidated-answer-review-1": [_review("SETTLED")],
                 }
             )
             result = ReviewRunner(native, peer).run_gear4(
-                RunRequest(
-                    material=UserMaterial("consensus request"),
-                    consensus=True,
-                    run_root=Path(root),
-                )
+                RunRequest(material=UserMaterial("severe lane request"), run_root=Path(root))
             )
-            self.assertEqual(result.answer, "C")
-            self.assertEqual(result.status, "PASSED")
-            consolidation_packet = next(
-                packet for role, packet in native.calls if role == "gear-4-consolidation"
+            self.assertEqual(
+                result.status, "SEVERE — UNRESOLVED, OWNER DECISION REQUIRED"
             )
-            self.assertIn("DEPTH LANE QUALITY STATUS", consolidation_packet)
-            self.assertIn("NOT PASSED", consolidation_packet)
-            self.assertIn("R3 — unresolved", consolidation_packet)
+            self.assertEqual(result.exit_code, 1)
 
+    def test_lane_failure_uses_labelled_gear3_fallback(self) -> None:
         with tempfile.TemporaryDirectory() as root:
             native = ScriptedAdapter(
                 {
-                    "gear-4-depth-draft": [lambda packet: _answer(packet, "PARTIAL-DEPTH")],
+                    "gear-4-depth-draft": [lambda p: _answer(p, "PARTIAL-DEPTH")],
                     "gear-4-breadth-draft": [CallFailure("native lane recovery failed")],
-                    "gear-3-initial-answer": [lambda packet: _answer(packet, "FALLBACK-ANSWER")],
-                    "gear-3-review-1": [_review("PASS")],
+                    "gear-3-initial-answer": [lambda p: _answer(p, "FALLBACK-ANSWER")],
+                    "gear-3-review-1": [_review("SETTLED")],
                 },
                 engine="claude",
             )
@@ -590,66 +550,59 @@ class AcceptanceTests(unittest.TestCase):
             self.assertTrue(
                 any("GEAR 4 UNAVAILABLE — GEAR 3 FALLBACK" in item for item in result.notices)
             )
-            self.assertIn(
-                "Native engine: `claude`",
-                Path(result.run_path).read_text(encoding="utf-8"),
-            )
             fallback_packet = next(
                 packet for role, packet in native.calls if role == "gear-3-initial-answer"
             )
             self.assertNotIn("PARTIAL-DEPTH", fallback_packet)
 
+    def test_consolidation_failure_carries_lane_findings_to_fallback(self) -> None:
+        # A consolidation failure must not drop the completed lanes'
+        # findings: the fallback reviewer receives them, including an
+        # unresolved severe lane review.
         with tempfile.TemporaryDirectory() as root:
-            request_path = Path(root) / "request.md"
-            request_path.write_text("fallback generation must fail", encoding="utf-8")
             native = ScriptedAdapter(
                 {
-                    "gear-4-depth-draft": [
-                        lambda packet: _answer(packet, "INTERMEDIATE-DEPTH-ONLY")
+                    "gear-4-depth-draft": [lambda p: _answer(p, "DEPTH-ORIGINAL")],
+                    "gear-4-breadth-review-1": [_review("SETTLED")],
+                    "gear-4-consolidation": [
+                        CallFailure("consolidation native failure"),
+                        CallFailure("consolidation native recovery failure"),
                     ],
-                    "gear-4-breadth-draft": [
-                        CallFailure("first Breadth failure"),
-                        CallFailure("Breadth recovery failure"),
+                    "gear-3-initial-answer": [lambda p: _answer(p, "FALLBACK-ANSWER")],
+                },
+                engine="claude",
+            )
+            peer = ScriptedAdapter(
+                {
+                    "gear-4-breadth-draft": [lambda p: _answer(p, "BREADTH-ORIGINAL")],
+                    "gear-4-depth-review-1": [
+                        _review(
+                            "SEVERE",
+                            "- R1 — lane defect.",
+                            severe="- S1 — traced path from a permitted input to data loss.",
+                        )
                     ],
-                    "gear-3-initial-answer": [
-                        CallFailure("first fallback failure"),
-                        CallFailure("fallback recovery failure"),
-                    ],
+                    "gear-3-review-1": [_review("SETTLED")],
                 }
             )
-            output_bytes = io.BytesIO()
-            stdout = io.TextIOWrapper(output_bytes, encoding="utf-8")
-            stderr = io.StringIO()
+            result = ReviewRunner(native, peer).run_gear4(
+                RunRequest(material=UserMaterial("severe lane request"), run_root=Path(root))
+            )
+            self.assertEqual(result.answer, "FALLBACK-ANSWER")
+            fallback_review = next(
+                packet for role, packet in peer.calls if role == "gear-3-review-1"
+            )
+            self.assertIn("DEPTH COMPLETE REVIEW 1", fallback_review)
+            self.assertIn(
+                "S1 — traced path from a permitted input to data loss", fallback_review
+            )
+            self.assertIn("BREADTH COMPLETE REVIEW 1", fallback_review)
 
-            def request_in_temp_root(**kwargs):
-                return RunRequest(run_root=Path(root) / "runs", **kwargs)
-
-            with (
-                patch.object(cli_module, "CodexAdapter", return_value=native),
-                patch.object(
-                    cli_module,
-                    "RunRequest",
-                    side_effect=request_in_temp_root,
-                ),
-                patch.object(cli_module.sys, "stdout", stdout),
-                patch.object(cli_module.sys, "stderr", stderr),
-            ):
-                exit_code = cli_module._run(
-                    "gear4", ["--request", str(request_path)]
-                )
-                stdout.flush()
-
-            self.assertEqual(exit_code, 1)
-            self.assertEqual(output_bytes.getvalue(), b"")
-            records = tuple((Path(root) / "runs").glob("*/RUN.md"))
-            self.assertEqual(len(records), 1)
-            run_text = records[0].read_text(encoding="utf-8")
-            self.assertIn("INTERMEDIATE-DEPTH-ONLY", run_text)
-            self.assertIn("TECHNICAL FAILURE — NO COMPLETE ANSWER", run_text)
-
+    def test_committed_breadth_requires_user_commitment(self) -> None:
         with tempfile.TemporaryDirectory() as root:
+            runner = ReviewRunner(ScriptedAdapter({}))
             with self.assertRaises(OraReviewError):
-                ReviewRunner(ScriptedAdapter({})).run_gear4(
+                runner.run_gear4(
                     RunRequest(
                         material=UserMaterial("request"),
                         breadth="committed",
@@ -657,697 +610,258 @@ class AcceptanceTests(unittest.TestCase):
                     )
                 )
             with self.assertRaises(OraReviewError):
-                ReviewRunner(ScriptedAdapter({})).run_gear4(
+                runner.run_gear4(
                     RunRequest(
                         material=UserMaterial("request", commitment=" \n\t"),
                         breadth="committed",
                         run_root=Path(root),
                     )
                 )
-
-    def test_validator_external_multi_root_contract(self) -> None:
-        preserved_response_path = (
-            Path(__file__).with_name("fixtures")
-            / "validator-prose-envelope-response.md"
-        )
-        preserved_response_bytes = preserved_response_path.read_bytes()
-        self.assertEqual(preserved_response_bytes.count(b"\n"), 89)
-        self.assertEqual(len(preserved_response_bytes), 11_741)
-        self.assertEqual(
-            hashlib.sha256(preserved_response_bytes).hexdigest(),
-            "763205387da02845103b5d512faec5765a8f7b9384797a00b422b4b53fa8d29f",
-        )
-        preserved_body, preserved_decisions = parse_root_decisions(
-            preserved_response_bytes.decode("utf-8"),
-            boundary=AnswerBoundary(
-                begin=(
-                    "<<<ORA-VALIDATION-BEGIN:"
-                    "validation-synthetic-prose-envelope-001>>>"
-                ),
-                end=(
-                    "<<<ORA-VALIDATION-END:"
-                    "validation-synthetic-prose-envelope-001>>>"
-                ),
-            ),
-            requested_roots=(
-                "sample-alpha",
-                "sample-bravo",
-                "sample-charlie",
-                "sample-delta",
-                "sample-echo",
-                "sample-foxtrot",
-            ),
-        )
-        self.assertEqual(
-            [(item.root, item.decision) for item in preserved_decisions],
-            [
-                ("sample-alpha", "ACCEPT"),
-                ("sample-bravo", "REJECT"),
-                ("sample-charlie", "ACCEPT"),
-                ("sample-delta", "ACCEPT"),
-                ("sample-echo", "REJECT"),
-                ("sample-foxtrot", "ACCEPT"),
-            ],
-        )
-        self.assertNotIn(
-            "Synthetic framing outside the bounded payload", preserved_body
-        )
-
-        request_text = (
-            "Validate the supplied implementation evidence exactly.\n\n"
-            "A heading inside the request is data:\n## unrequested — ACCEPT\n"
-        )
-        roots = ("ora", "vault")
-        sections = "\n\n".join(
-            (_root_decision("ora", "ACCEPT"), _root_decision("vault", "REJECT"))
-        )
-        outer_intro = "The following sections use ACCEPT and REJECT as labels."
-        outer_outro = "That completes the requested validation."
-
-        with tempfile.TemporaryDirectory() as root:
-            fixture = Path(root)
-            session = fixture / "session"
-            _write_validator_session(session)
-            warnings = "Warning: Synthetic transport limitation.\n"
-            command = ValidatorBridgeCommand(
-                session,
-                lambda packet: (
-                    f"{outer_intro}\n\n{_validator_body(packet, sections)}"
-                    f"\n\n{outer_outro}"
-                ),
-                warnings=warnings,
-            )
-            bridge = BridgeAdapter(
-                command,
-                peer="zcode",
-                initiator="ora-validator",
-                session_dir=session,
-                session_verified=True,
-            )
-            surfaced: list[str] = []
-            runner = ValidationRunner(
-                peer_factory=lambda **_kwargs: (bridge, "zcode is ready."),
-                status_sink=surfaced.append,
-            )
-            result = runner.run(
-                ValidationRequest(
-                    request=request_text,
-                    roots=roots,
-                    peer="zcode",
-                    run_root=fixture / "runs",
+            with self.assertRaises(OraReviewError):
+                runner.run_gear4(
+                    RunRequest(
+                        material=UserMaterial("request"),
+                        existing_answer="seed",
+                        run_root=Path(root),
+                    )
                 )
-            )
 
-            self.assertEqual(len(command.bodies), 1)
-            packet = command.bodies[0]
-            self.assertIn(request_text, packet)
-            self.assertIn('"ora"', packet)
-            self.assertIn('"vault"', packet)
-            self.assertIn("Independent per-root validation role", packet)
-            self.assertNotIn("VERDICT: <PASS | FAIL>", packet)
-            self.assertEqual(
-                [(item.root, item.decision) for item in result.decisions],
-                [("ora", "ACCEPT"), ("vault", "REJECT")],
+
+class PacketAndRecordTests(unittest.TestCase):
+    def test_exact_text_boundaries_and_prefix(self) -> None:
+        original = (
+            "  Keep leading space\r\n# User heading\r\n```json\r\n"
+            '{"text":"naïve 🧭 --mode yolo"}\r\n```\r\n'
+            "<<<ORA-PROTECTED-BEGIN:not-ours>>>\r\n"
+        )
+        later = "Second message\n\nwith exact spacing.\n"
+        material = UserMaterial(original=original, later_user_messages=(later,))
+        builder = PacketBuilder()
+        boundary = builder.answer_boundary()
+        packet = builder.build(
+            material=material,
+            role_files=("initial-answer.md",),
+            output_file="output-answer.md",
+            stage_material=(StageMaterial("EXACT STAGE", "STATUS: NOT PASSED"),),
+            answer_boundary=boundary,
+        )
+        self.assertIn(original, packet)
+        self.assertIn(later, packet)
+        self.assertIn("STATUS: NOT PASSED", packet)
+        self.assertLess(packet.index("# CONTROLLING ORA INSTRUCTIONS"), packet.index(original))
+        strict = '{"answer":"kept exactly"}'
+        self.assertEqual(extract_answer(_answer(packet, strict), boundary), strict)
+        with self.assertRaises(MalformedResponse):
+            extract_answer("no supplied boundaries", boundary)
+
+    def test_instruction_prefix_core_turn_repository(self) -> None:
+        # The resolved core, the verbatim turn body, and the repository's
+        # root AGENTS.md lead every packet of the run, and the binding
+        # expires with it.
+        native = ScriptedAdapter({
+            "gear-3-initial-answer": [lambda p: _answer(p, "first answer")],
+            "gear-3-review-1": [_review("SETTLED")],
+        })
+        with tempfile.TemporaryDirectory() as root:
+            repo = Path(root) / "repo"
+            repo.mkdir()
+            (repo / "AGENTS.md").write_text(
+                "Rule: one file per change.", encoding="utf-8"
             )
-            self.assertIn("# Ora Validator Result", result.output)
-            self.assertIn("Route: **external**", result.output)
-            self.assertIn('Selected peer: "zcode"', result.output)
-            self.assertIn('Bridge direction: "zcode" → "ora-validator"', result.output)
-            self.assertIn('Response message: "0002-peer-to-initiator.md"', result.output)
-            self.assertIn("Fallback: **none**", result.output)
-            self.assertIn(sections, result.output)
-            self.assertNotIn(outer_intro, result.output)
-            self.assertNotIn(outer_outro, result.output)
-            self.assertNotIn("ORA-VALIDATION-BEGIN", result.output)
-            self.assertEqual(result.provenance.peer, "zcode")
-            self.assertEqual(result.provenance.initiator, "ora-validator")
-            self.assertEqual(result.provenance.session_dir, session.resolve())
-            self.assertEqual(
-                result.provenance.response_path,
-                (session / "messages" / "0002-peer-to-initiator.md").resolve(),
-            )
-            self.assertEqual(result.provenance.message_sequence, 2)
-            self.assertEqual(result.provenance.from_label, "zcode")
-            self.assertEqual(result.provenance.to_label, "ora-validator")
-            self.assertTrue(result.provenance.session_verified)
-            response_bytes = result.provenance.response_path.read_bytes()
-            self.assertEqual(
-                result.provenance.response_sha256,
-                hashlib.sha256(response_bytes).hexdigest(),
-            )
-            self.assertEqual(surfaced, ["zcode is ready.", warnings])
+            runner = ReviewRunner(native=native)
+            result = runner.run_gear3(RunRequest(
+                material=UserMaterial("Review this exact answer."),
+                current_turn_instructions=TEST_OVERRIDE,
+                repository_path=repo,
+                run_root=Path(root) / "runs",
+            ))
             run_text = Path(result.run_path).read_text(encoding="utf-8")
-            self.assertIn("Tool: `ora-validator`", run_text)
-            self.assertIn("Route at start: `external`", run_text)
-            self.assertNotIn("Native engine:", run_text)
-            self.assertIn("Selected peer: `zcode`", run_text)
-            self.assertIn("Fallback: `none`", run_text)
-            self.assertIn("Verified transport provenance", run_text)
-            self.assertIn(result.provenance.response_sha256, run_text)
-            self.assertIn("Status: **VALIDATION COMPLETE**", run_text)
+        self.assertEqual(result.status, "PASSED")
+        for role, packet in native.calls:
+            self.assertLess(
+                packet.index("## CORE RULES — UNIVERSAL"),
+                packet.index("## UNIVERSAL LAWS"), role)
+            self.assertEqual(packet.count(TEST_CORE), 1, role)
+            self.assertIn(TEST_OVERRIDE, packet, role)
+            self.assertIn("Rule: one file per change.", packet, role)
+            self.assertIn("## REPOSITORY INSTRUCTIONS", packet, role)
+        self.assertIsNone(runner.packet_builder.instruction_prefix)
+        self.assertIn("RESOLVED INSTRUCTION PREFIX — VERBATIM", run_text)
 
-        invalid_responses = {
-            "extra-supplied-marker-before": lambda packet: (
-                re.findall(r"<<<ORA-VALIDATION-BEGIN:[^\n>]+>>>", packet)[-1]
-                + "\n"
-                + _validator_body(packet, sections)
-            ),
-            "foreign-marker-before": lambda packet: (
-                "<<<ORA-VALIDATION-BEGIN:validation-foreign>>>\n"
-                + _validator_body(packet, sections)
-            ),
-            "requested-root-verdict-before": lambda packet: (
-                "## ora — REJECT\n\n"
-                + _validator_body(packet, sections)
-            ),
-            "unknown-root-verdict-after": lambda packet: (
-                _validator_body(packet, sections)
-                + "\n\n## other — ACCEPT"
-            ),
-            "mixed-case-root-verdict-before": lambda packet: (
-                "## ora — Reject\n\n"
-                + _validator_body(packet, sections)
-            ),
-            "standalone-accept-before": lambda packet: (
-                "ACCEPT\n\n" + _validator_body(packet, sections)
-            ),
-            "closing-heading-standalone-accept-before": lambda packet: (
-                "# ACCEPT #\n\n" + _validator_body(packet, sections)
-            ),
-            "standalone-reject-after": lambda packet: (
-                _validator_body(packet, sections) + "\n\nREJECT"
-            ),
-            "aggregate-pass-before": lambda packet: (
-                "Overall verdict: PASS\n\n"
-                + _validator_body(packet, sections)
-            ),
-            "aggregate-fail-after": lambda packet: (
-                _validator_body(packet, sections) + "\n\nFAIL"
-            ),
-            "mixed-case-aggregate-after": lambda packet: (
-                _validator_body(packet, sections)
-                + "\n\nOverall verdict: Fail"
-            ),
-            "closing-heading-labelled-verdict-after": lambda packet: (
-                _validator_body(packet, sections)
-                + "\n\n### VERDICT: PASS ###"
-            ),
-            "validator-field-before": lambda packet: (
-                "### EVIDENCE\nA stray field outside the result.\n\n"
-                + _validator_body(packet, sections)
-            ),
-            "trusted-result-heading-after": lambda packet: (
-                _validator_body(packet, sections) + "\n\n# Ora Validator Result"
-            ),
-            "closing-trusted-result-heading-after": lambda packet: (
-                _validator_body(packet, sections)
-                + "\n\n# Ora Validator Result #"
-            ),
-            "aggregate-pass": lambda packet: _validator_body(
-                packet, "VERDICT: PASS"
-            ),
-            "indented-aggregate-fail": lambda packet: _validator_body(
-                packet, sections + "\n   VERDICT: FAIL"
-            ),
-            "decorated-aggregate-pass": lambda packet: _validator_body(
-                packet, sections + "\n**VERDICT:** PASS"
-            ),
-            "split-aggregate-pass": lambda packet: _validator_body(
-                packet, sections + "\n# OVERALL\nPASS"
-            ),
-            "standalone-pass": lambda packet: _validator_body(
-                packet, sections + "\nPASS"
-            ),
-            "crlf-aggregate-result-pass": lambda packet: _validator_body(
-                packet,
-                _root_decision("ora")
-                + "\r\nOverall result: PASS\r\n"
-                + _root_decision("vault", "REJECT"),
-            ),
-            "missing-root": lambda packet: _validator_body(
-                packet, _root_decision("ora")
-            ),
-            "unexpected-root": lambda packet: _validator_body(
-                packet,
-                "\n\n".join(
-                    (
-                        _root_decision("ora"),
-                        _root_decision("vault"),
-                        _root_decision("other"),
-                    )
-                ),
-            ),
-            "duplicate-root": lambda packet: _validator_body(
-                packet,
-                "\n\n".join(
-                    (
-                        _root_decision("ora"),
-                        _root_decision("ora", "REJECT"),
-                        _root_decision("vault"),
-                    )
-                ),
-            ),
-            "indented-duplicate-root": lambda packet: _validator_body(
-                packet,
-                sections
-                + "\n\n   "
-                + _root_decision("ora", "REJECT").replace("\n", "\n   "),
-            ),
-            "indented-unexpected-root": lambda packet: _validator_body(
-                packet,
-                sections
-                + "\n\n   "
-                + _root_decision("other").replace("\n", "\n   "),
-            ),
-            "malformed-decision": lambda packet: _validator_body(
-                packet,
-                "\n\n".join(
-                    (
-                        _root_decision("ora").replace("— ACCEPT", "— PASS", 1),
-                        _root_decision("vault"),
-                    )
-                ),
-            ),
-            "missing-field": lambda packet: _validator_body(
-                packet,
-                "\n\n".join(
-                    (
-                        _root_decision("ora").split("\n\n### LIMITATIONS", 1)[0],
-                        _root_decision("vault"),
-                    )
-                ),
-            ),
-            "empty-field": lambda packet: _validator_body(
-                packet,
-                "\n\n".join(
-                    (
-                        _root_decision("ora").replace(
-                            "### EVIDENCE\nEvidence inspected for ora.",
-                            "### EVIDENCE\n",
-                        ),
-                        _root_decision("vault"),
-                    )
-                ),
-            ),
-            "duplicate-field": lambda packet: _validator_body(
-                packet,
-                "\n\n".join(
-                    (
-                        _root_decision("ora").replace(
-                            "### LIMITATIONS",
-                            "### EVIDENCE\nDuplicate evidence.\n\n### LIMITATIONS",
-                        ),
-                        _root_decision("vault"),
-                    )
-                ),
-            ),
-            "indented-duplicate-field": lambda packet: _validator_body(
-                packet,
-                "\n\n".join(
-                    (
-                        _root_decision("ora").replace(
-                            "### LIMITATIONS",
-                            "   ### EVIDENCE\n   Duplicate evidence.\n\n"
-                            "### LIMITATIONS",
-                        ),
-                        _root_decision("vault"),
-                    )
-                ),
-            ),
-            "indented-extra-field": lambda packet: _validator_body(
-                packet,
-                "\n\n".join(
-                    (
-                        _root_decision("ora").replace(
-                            "### LIMITATIONS",
-                            "   ### NOTES\n   Unrequested field.\n\n"
-                            "### LIMITATIONS",
-                        ),
-                        _root_decision("vault"),
-                    )
-                ),
-            ),
-            "missing-wrapper": lambda _packet: sections,
-        }
-
-        for name, response_factory in invalid_responses.items():
-            with self.subTest(name=name), tempfile.TemporaryDirectory() as root:
-                fixture = Path(root)
-                session = fixture / "session"
-                _write_validator_session(session)
-                command = ValidatorBridgeCommand(session, response_factory)
-                bridge = BridgeAdapter(
-                    command,
-                    peer="zcode",
-                    initiator="ora-validator",
-                    session_dir=session,
-                    session_verified=True,
-                )
-                runner = ValidationRunner(
-                    peer_factory=lambda **_kwargs: (bridge, "zcode is ready.")
-                )
-                with self.assertRaises(OraReviewError):
-                    runner.run(
-                        ValidationRequest(
-                            request=request_text,
-                            roots=roots,
-                            peer="zcode",
-                            run_root=fixture / "runs",
-                        )
-                    )
-                self.assertEqual(len(command.bodies), 1)
-                records = tuple((fixture / "runs").glob("*/RUN.md"))
-                self.assertEqual(len(records), 1)
-                self.assertIn(
-                    "Status: **TECHNICAL FAILURE — NO CERTIFICATION**",
-                    records[0].read_text(encoding="utf-8"),
-                )
-
-        transport_cases = (
-            (
-                "conflicting-direction",
-                {
-                    "header_factory": lambda sequence: (
-                        f"# Message {sequence}\nFrom: zcode\nFrom: other\n"
-                        "To: ora-validator"
-                    )
-                },
-                False,
-            ),
-            (
-                "message-id-mismatch",
-                {
-                    "header_factory": lambda _sequence: (
-                        "# Message 0004\nFrom: zcode\nTo: ora-validator"
-                    )
-                },
-                False,
-            ),
-            ("multiple-new-responses", {"extra_response": True}, False),
-            ("stale-reported-response", {}, True),
-            ("failed-after-publication", {"returncode": 1}, False),
-        )
-        for name, options, preseed in transport_cases:
-            with self.subTest(name=name), tempfile.TemporaryDirectory() as root:
-                fixture = Path(root)
-                session = fixture / "session"
-                _write_validator_session(session)
-                if preseed:
-                    (session / "messages" / "0002-peer-to-initiator.md").write_text(
-                        "# Message 0002\nFrom: zcode\nTo: ora-validator\n\n"
-                        "## Body\n\nstale response",
-                        encoding="utf-8",
-                    )
-                command = ValidatorBridgeCommand(
-                    session,
-                    lambda packet: _validator_body(packet, sections),
-                    **options,
-                )
-                bridge = BridgeAdapter(
-                    command,
-                    peer="zcode",
-                    initiator="ora-validator",
-                    session_dir=session,
-                    session_verified=True,
-                )
-                runner = ValidationRunner(
-                    peer_factory=lambda **_kwargs: (bridge, "zcode is ready.")
-                )
-                with self.assertRaises(OraReviewError):
-                    runner.run(
-                        ValidationRequest(
-                            request=request_text,
-                            roots=roots,
-                            peer="zcode",
-                            run_root=fixture / "runs",
-                        )
-                    )
-                self.assertEqual(len(command.bodies), 1)
-                record = next((fixture / "runs").glob("*/RUN.md"))
-                record_text = record.read_text(encoding="utf-8")
-                self.assertIn("TECHNICAL FAILURE — NO CERTIFICATION", record_text)
-                self.assertNotIn("Status: **VALIDATION COMPLETE**", record_text)
-
+    def test_master_fail_open_with_loud_warning(self) -> None:
+        # A selected master that is missing or malformed never stops the
+        # run: it proceeds without the core and carries a loud warning.
         with tempfile.TemporaryDirectory() as root:
-            fixture = Path(root)
-            calls: list[dict[str, str]] = []
+            root_path = Path(root)
+            broken = root_path / "broken-master.md"
+            broken.write_text("no core markers here", encoding="utf-8")
+            for name, selected in (
+                ("missing", str(root_path / "missing.md")),
+                ("malformed", str(broken)),
+            ):
+                with self.subTest(master=name):
+                    native = ScriptedAdapter({
+                        "gear-3-initial-answer": [
+                            lambda p: _answer(p, f"answer {name}")],
+                        "gear-3-review-1": [_review("SETTLED")],
+                    })
+                    with patch.dict(
+                        os.environ, {"ORA_INSTRUCTION_MASTER": selected}
+                    ):
+                        result = ReviewRunner(native).run_gear3(
+                            RunRequest(
+                                material=UserMaterial("m"),
+                                run_root=root_path / f"runs-{name}",
+                            )
+                        )
+                    self.assertEqual(result.status, "PASSED")
+                    self.assertTrue(any(
+                        "WARNING" in notice and selected in notice
+                        for notice in result.notices
+                    ))
+                    self.assertNotIn("## CORE RULES — UNIVERSAL", native.calls[0][1])
 
-            def unavailable(**kwargs):
-                calls.append(kwargs)
-                raise CallFailure("Selected peer is unavailable.", "Sign in first.")
-
-            runner = ValidationRunner(peer_factory=unavailable)
-            with self.assertRaisesRegex(CallFailure, "unavailable"):
-                runner.run(
-                    ValidationRequest(
-                        request=request_text,
-                        roots=roots,
-                        peer="zcode",
-                        run_root=fixture / "runs",
+    def test_unconfigured_master_notice(self) -> None:
+        with tempfile.TemporaryDirectory() as root:
+            home = Path(root) / "home"
+            home.mkdir()
+            native = ScriptedAdapter({
+                "gear-3-initial-answer": [lambda p: _answer(p, "no core")],
+                "gear-3-review-1": [_review("SETTLED")],
+            })
+            with (
+                patch.dict(os.environ, {"ORA_INSTRUCTION_MASTER": ""}),
+                patch.object(Path, "home", return_value=home),
+            ):
+                result = ReviewRunner(native).run_gear3(
+                    RunRequest(
+                        material=UserMaterial("m"), run_root=Path(root) / "runs"
                     )
                 )
-            self.assertEqual(len(calls), 1)
-            self.assertIsNotNone(runner.run_path)
-            self.assertIn(
-                "TECHNICAL FAILURE — NO CERTIFICATION",
-                Path(runner.run_path).read_text(encoding="utf-8"),
-            )
+            self.assertEqual(result.status, "PASSED")
+            self.assertIn(NO_MASTER_NOTICE, result.notices)
+            self.assertNotIn("## CORE RULES — UNIVERSAL", native.calls[0][1])
 
-        peer_calls = 0
-
-        def should_not_prepare(**_kwargs):
-            nonlocal peer_calls
-            peer_calls += 1
-            raise AssertionError("duplicate root configuration reached the peer")
-
-        with self.assertRaisesRegex(OraReviewError, "exactly once"):
-            ValidationRunner(peer_factory=should_not_prepare).run(
-                ValidationRequest(
-                    request=request_text,
-                    roots=("ora", "ora"),
-                    peer="zcode",
-                )
-            )
-        self.assertEqual(peer_calls, 0)
-
+    def test_repository_refusals_happen_before_any_call(self) -> None:
+        native = ScriptedAdapter({})
+        runner = ReviewRunner(native=native)
         with tempfile.TemporaryDirectory() as root:
-            fixture = Path(root)
-            session = fixture / "session"
-            _write_validator_session(session)
-            command = ValidatorBridgeCommand(
-                session,
-                lambda packet: _validator_body(
-                    packet, sections + "\nOverall result: PASS"
-                ),
-            )
-            bridge = BridgeAdapter(
-                command,
-                peer="zcode",
-                initiator="ora-validator",
-                session_dir=session,
-                session_verified=True,
-            )
-            request_path = fixture / "request.md"
-            request_path.write_text(request_text, encoding="utf-8")
+            with self.assertRaises(OraReviewError):
+                runner.run_gear3(RunRequest(
+                    material=UserMaterial("m"),
+                    repository_path=Path(root) / "nope",
+                    run_root=Path(root) / "runs",
+                ))
+        self.assertEqual(native.calls, [])
+
+
+class CliSurfaceTests(unittest.TestCase):
+    def test_run_status_surfaces(self) -> None:
+        with tempfile.TemporaryDirectory() as root:
+            root_path = Path(root)
+            request_path = root_path / "request.md"
+            request_path.write_text("Review this exact answer.", encoding="utf-8")
+            answer_path = root_path / "answer.md"
+            answer_path.write_text("complete answer", encoding="utf-8")
+            native = ScriptedAdapter({"gear-3-review-1": [_review("SETTLED")]})
             output_bytes = io.BytesIO()
             stdout = io.TextIOWrapper(output_bytes, encoding="utf-8")
             stderr = io.StringIO()
-
-            def runner_factory(*, status_sink):
-                return ValidationRunner(
-                    peer_factory=lambda **_kwargs: (bridge, "zcode is ready."),
-                    status_sink=status_sink,
-                )
-
-            def request_in_temp_root(**kwargs):
-                return ValidationRequest(run_root=fixture / "runs", **kwargs)
-
             with (
-                patch.object(cli_module, "ValidationRunner", side_effect=runner_factory),
+                patch.object(cli_module, "CodexAdapter", return_value=native),
                 patch.object(
                     cli_module,
-                    "ValidationRequest",
-                    side_effect=request_in_temp_root,
-                ),
-                patch.object(cli_module.sys, "stdout", stdout),
-                patch.object(cli_module.sys, "stderr", stderr),
-            ):
-                exit_code = cli_module._run_validator(
-                    [
-                        "--request",
-                        str(request_path),
-                        "--root",
-                        "ora",
-                        "--root",
-                        "vault",
-                        "--peer",
-                        "zcode",
-                    ]
-                )
-                stdout.flush()
-
-            self.assertEqual(exit_code, 1)
-            self.assertEqual(output_bytes.getvalue(), b"")
-            self.assertEqual(len(command.bodies), 1)
-            self.assertIn("no certification", stderr.getvalue())
-            self.assertIn("Run record:", stderr.getvalue())
-
-    def test_adapter_packet_parity_readiness_and_published_failure(self) -> None:
-        packet = "# exact packet\n\n--mode yolo\nUnicode 🧭\r\n"
-        warnings = (
-            "Warning: The selected CLI may retain plaintext transcripts.\n"
-            "Warning: Local configuration can change external effects — inspect it.\n"
-        )
-        with tempfile.TemporaryDirectory() as root:
-            session = Path(root) / "session"
-            command = FakeBridgeCommand(session, warnings=warnings)
-            bridge = BridgeAdapter(
-                command, peer="zcode", initiator="ora-gear-3", session_dir=session
-            )
-            response = bridge.call(packet, role="gear-3-review-1")
-            self.assertEqual(command.bodies, [packet])
-            self.assertEqual(response, _review("PASS"))
-
-            native = ScriptedAdapter({"same-role": ["same response"]})
-            self.assertEqual(native.call(packet, role="same-role"), "same response")
-            self.assertEqual(native.calls[0][1], command.bodies[0])
-
-            request_path = Path(root) / "request.md"
-            request_path.write_text(packet, encoding="utf-8")
-            answer = '{"answer":"unchanged"}'
-            answer_path = Path(root) / "answer.md"
-            answer_path.write_text(answer, encoding="utf-8")
-            output_bytes = io.BytesIO()
-            stdout = io.TextIOWrapper(output_bytes, encoding="utf-8")
-            stderr = io.StringIO()
-            readiness = "zcode is ready.\nWarning: Initial readiness disclosure."
-            run_command = command.run
-
-            def warned_call(arguments, **kwargs):
-                self.assertIn(readiness, stderr.getvalue())
-                return run_command(arguments, **kwargs)
-
-            with (
-                patch.object(cli_module, "CodexAdapter", return_value=ScriptedAdapter({})),
-                patch.object(BridgeAdapter, "prepare", return_value=(bridge, readiness)),
-                patch.object(command, "run", side_effect=warned_call),
-                patch.object(
-                    cli_module, "RunRequest",
+                    "RunRequest",
                     side_effect=lambda **kwargs: RunRequest(
-                        run_root=Path(root) / "runs", **kwargs
+                        **{**kwargs, "run_root": root_path / "runs"}
                     ),
                 ),
                 patch.object(cli_module.sys, "stdout", stdout),
                 patch.object(cli_module.sys, "stderr", stderr),
             ):
                 exit_code = cli_module._run(
-                    "gear3", [
-                        "--request", str(request_path),
-                        "--current-answer", str(answer_path), "--peer", "zcode",
-                    ],
+                    "gear3",
+                    ["--request", str(request_path), "--current-answer", str(answer_path)],
                 )
                 stdout.flush()
-
             self.assertEqual(exit_code, 0)
-            self.assertEqual(output_bytes.getvalue(), answer.encode("utf-8"))
-            self.assertIn(warnings, stderr.getvalue())
-            self.assertIn(
-                "the model and reasoning effort Codex reports using are recorded.",
-                stderr.getvalue(),
-            )
-            self.assertNotIn(
-                "successful native call must return one unambiguous exact model attribution",
-                stderr.getvalue(),
-            )
-            records = tuple((Path(root) / "runs").glob("*/RUN.md"))
+            self.assertEqual(output_bytes.getvalue(), b"complete answer")
+            status = stderr.getvalue()
+            self.assertIn("Ora Gear 3; native engine `codex`.", status)
+            self.assertIn("Status: PASSED", status)
+            self.assertIn("Run record:", status)
+            # The long manufactured route prose is gone: one configuration
+            # line only.
+            self.assertNotIn("Fresh context is guaranteed", status)
+            self.assertNotIn("plaintext transcripts", status)
+            records = tuple((root_path / "runs").glob("*/RUN.md"))
             self.assertEqual(len(records), 1)
-            self.assertIn(warnings, records[0].read_text(encoding="utf-8"))
 
-        for engine in ("codex", "claude"):
-            with self.subTest(cli_native_engine=engine), tempfile.TemporaryDirectory() as root:
-                fixture = Path(root)
-                request_path = fixture / "request.md"
-                request_path.write_text(packet, encoding="utf-8")
-                answer_path = fixture / "answer.md"
-                answer_path.write_text("complete answer", encoding="utf-8")
-                selected = ScriptedAdapter(
-                    {"gear-3-review-1": [_review("PASS")]},
-                    engine=engine,
-                )
+    def test_removed_options_are_rejected(self) -> None:
+        for option in ("--consensus", "--assigned-path", "--assigned-path=x"):
+            with self.subTest(option=option), self.assertRaises(SystemExit):
+                cli_module._run("gear3", ["--request", "x", option])
+        with self.assertRaises(SystemExit):
+            cli_module._run("gear4", ["--request", "x", "--consensus"])
 
-                def selected_factory():
-                    return selected
 
-                def unselected_factory():
-                    raise AssertionError("the unselected native engine was constructed")
+class ReadOnlyEngineTests(unittest.TestCase):
+    """The two native adapters start fresh, restricted, read-only calls."""
 
-                codex_factory = selected_factory if engine == "codex" else unselected_factory
-                claude_factory = selected_factory if engine == "claude" else unselected_factory
-                output_bytes = io.BytesIO()
-                stdout = io.TextIOWrapper(output_bytes, encoding="utf-8")
-                stderr = io.StringIO()
-                arguments = [
-                    "--request",
-                    str(request_path),
-                    "--current-answer",
-                    str(answer_path),
-                ]
-                if engine != "codex":
-                    arguments.extend(("--native", engine))
-
-                with (
-                    patch.object(cli_module, "CodexAdapter", side_effect=codex_factory),
-                    patch.object(cli_module, "ClaudeAdapter", side_effect=claude_factory),
-                    patch.object(
-                        cli_module,
-                        "RunRequest",
-                        side_effect=lambda **kwargs: RunRequest(
-                            run_root=fixture / "runs", **kwargs
-                        ),
-                    ),
-                    patch.object(cli_module.sys, "stdout", stdout),
-                    patch.object(cli_module.sys, "stderr", stderr),
-                ):
-                    exit_code = cli_module._run("gear3", arguments)
-                    stdout.flush()
-
-                self.assertEqual(exit_code, 0)
-                self.assertEqual(output_bytes.getvalue(), b"complete answer")
-                self.assertEqual([role for role, _ in selected.calls], ["gear-3-review-1"])
-                self.assertIn(f"native engine `{engine}`", stderr.getvalue())
-                if engine == "claude":
-                    self.assertIn(
-                        "every successful native call must return one unambiguous "
-                        "exact model attribution, which is recorded.",
-                        stderr.getvalue(),
-                    )
-                else:
-                    self.assertIn(
-                        "the model and reasoning effort Codex reports using "
-                        "are recorded.",
-                        stderr.getvalue(),
-                    )
-                    self.assertNotIn(
-                        "successful native call must return one unambiguous exact "
-                        "model attribution",
-                        stderr.getvalue(),
-                    )
-                record = next((fixture / "runs").glob("*/RUN.md"))
-                self.assertIn(f"Native engine: `{engine}`", record.read_text(encoding="utf-8"))
-
+    def test_codex_adapter_arguments_and_reporting(self) -> None:
         with tempfile.TemporaryDirectory() as root:
             fixture = Path(root)
-            executable = fixture / "claude"
-            argv_path = fixture / "argv.json"
+            argv_path = fixture / "codex-argv.json"
             stdin_path = fixture / "stdin.bin"
+            executable = fixture / "codex"
+            executable.write_text(
+                f"#!{sys.executable}\n"
+                "import json, sys\n"
+                "from pathlib import Path\n"
+                f"Path({str(argv_path)!r}).write_text(json.dumps(sys.argv[1:]), encoding='utf-8')\n"
+                f"Path({str(stdin_path)!r}).write_bytes(sys.stdin.buffer.read())\n"
+                "sys.stderr.write(\n"
+                "    'OpenAI Codex v0.162.1\\n'\n"
+                "    'model: gpt-5.3\\n'\n"
+                "    'reasoning effort: high\\n'\n"
+                ")\n"
+                "out = sys.argv[sys.argv.index('--output-last-message') + 1]\n"
+                f"Path(out).write_text({_review('SETTLED')!r}, encoding='utf-8')\n",
+                encoding="utf-8",
+            )
+            executable.chmod(0o700)
+            adapter = CodexAdapter(str(executable), model="gpt-5.3", effort="high")
+            response = adapter.call("# exact packet", role="codex-read-only")
+            self.assertEqual(response, _review("SETTLED"))
+            self.assertEqual(adapter.reported_model, "gpt-5.3")
+            self.assertEqual(adapter.reported_effort, "high")
+            self.assertEqual(stdin_path.read_bytes(), b"# exact packet")
+            arguments = json.loads(argv_path.read_text(encoding="utf-8"))
+            for required in (
+                "exec", "--ephemeral", "--ignore-user-config", "--ignore-rules",
+                "--skip-git-repo-check",
+            ):
+                self.assertIn(required, arguments)
+            self.assertEqual(
+                arguments[arguments.index("--sandbox") + 1], "read-only"
+            )
+            self.assertEqual(arguments[arguments.index("-m") + 1], "gpt-5.3")
+            self.assertEqual(
+                arguments[arguments.index("-c") + 1], "model_reasoning_effort=high"
+            )
+
+    def test_claude_adapter_restrictions_and_attribution(self) -> None:
+        with tempfile.TemporaryDirectory() as root:
+            fixture = Path(root)
+            argv_path = fixture / "claude-argv.json"
             cwd_path = fixture / "cwd.txt"
             env_path = fixture / "env.json"
+            executable = fixture / "claude"
             executable.write_text(
                 f"#!{sys.executable}\n"
                 "import json, os, sys\n"
                 "from pathlib import Path\n"
                 f"Path({str(argv_path)!r}).write_text(json.dumps(sys.argv[1:]), encoding='utf-8')\n"
-                f"Path({str(stdin_path)!r}).write_bytes(sys.stdin.buffer.read())\n"
                 f"Path({str(cwd_path)!r}).write_text(str(Path.cwd()), encoding='utf-8')\n"
                 f"Path({str(env_path)!r}).write_text(json.dumps({{name: name in os.environ for name in {ClaudeAdapter._NON_SUBSCRIPTION_ENVIRONMENT!r}}}), encoding='utf-8')\n"
                 "sys.stdout.write(json.dumps({\n"
@@ -1364,40 +878,20 @@ class AcceptanceTests(unittest.TestCase):
             }
             with patch.dict(os.environ, contaminated, clear=False):
                 adapter = ClaudeAdapter(str(executable), model="fable")
-                response = adapter.call(
-                    packet,
-                    role="claude-exact-packet",
-                )
-
+                response = adapter.call("# exact packet", role="claude-read-only")
             self.assertEqual(response, "complete Claude response\n")
             self.assertEqual(adapter.effective_model, "claude-fable-5")
-            self.assertEqual(stdin_path.read_bytes(), packet.encode("utf-8"))
+            arguments = json.loads(argv_path.read_text(encoding="utf-8"))
+            for required in (
+                "--print", "--no-session-persistence", "--safe-mode",
+                "--restricted", "--strict-mcp-config", "--no-chrome",
+                "--disable-slash-commands",
+            ):
+                self.assertIn(required, arguments)
             self.assertEqual(
-                json.loads(argv_path.read_text(encoding="utf-8")),
-                [
-                    "--print",
-                    "--input-format",
-                    "text",
-                    "--output-format",
-                    "json",
-                    "--model",
-                    "fable",
-                    "--no-session-persistence",
-                    "--safe-mode",
-                    "--restricted",
-                    "--permission-mode",
-                    "dontAsk",
-                    "--tools",
-                    "",
-                    "--strict-mcp-config",
-                    "--mcp-config",
-                    "{}",
-                    "--no-chrome",
-                    "--disable-slash-commands",
-                    "--prompt-suggestions",
-                    "false",
-                ],
+                arguments[arguments.index("--permission-mode") + 1], "dontAsk"
             )
+            self.assertEqual(arguments[arguments.index("--tools") + 1], "")
             native_directory = Path(cwd_path.read_text(encoding="utf-8"))
             self.assertNotEqual(native_directory, fixture)
             self.assertFalse(native_directory.exists())
@@ -1408,155 +902,98 @@ class AcceptanceTests(unittest.TestCase):
                 )
             )
 
+    def test_claude_ambiguous_attribution_is_not_a_failure(self) -> None:
+        # The reported model is recorded only where unambiguous; an
+        # ambiguous report never fails the call.
         with tempfile.TemporaryDirectory() as root:
-            fixture = Path(root)
-            executable = fixture / "claude"
-            calls_path = fixture / "calls.json"
-            request_path = fixture / "request.md"
-            answer_path = fixture / "answer.md"
-            request_path.write_text(packet, encoding="utf-8")
-            answer_path.write_text("complete answer", encoding="utf-8")
+            executable = Path(root) / "claude"
             executable.write_text(
                 f"#!{sys.executable}\n"
                 "import json, sys\n"
-                "from pathlib import Path\n"
-                f"calls_path = Path({str(calls_path)!r})\n"
-                "calls = json.loads(calls_path.read_text(encoding='utf-8')) if calls_path.exists() else []\n"
-                "calls.append(sys.argv[1:])\n"
-                "calls_path.write_text(json.dumps(calls), encoding='utf-8')\n"
-                "model = 'claude-sonnet-4-5' if len(calls) == 1 else 'claude-fable-5'\n"
                 "sys.stdout.write(json.dumps({\n"
                 "    'type': 'result', 'subtype': 'success', 'is_error': False,\n"
-                f"    'result': {_review('PASS')!r},\n"
-                "    'modelUsage': {model: {'outputTokens': 5}},\n"
+                "    'result': 'answer text',\n"
+                "    'modelUsage': {'a': 1, 'b': 2},\n"
                 "}))\n",
                 encoding="utf-8",
             )
             executable.chmod(0o700)
-            output_bytes = io.BytesIO()
-            stdout = io.TextIOWrapper(output_bytes, encoding="utf-8")
-            stderr = io.StringIO()
-            with (
-                patch.object(
-                    cli_module,
-                    "ClaudeAdapter",
-                    side_effect=lambda **kwargs: ClaudeAdapter(
-                        str(executable), **kwargs
-                    ),
-                ),
-                patch.object(
-                    cli_module,
-                    "RunRequest",
-                    side_effect=lambda **kwargs: RunRequest(
-                        run_root=fixture / "runs", **kwargs
-                    ),
-                ),
-                patch.object(cli_module.sys, "stdout", stdout),
-                patch.object(cli_module.sys, "stderr", stderr),
-            ):
-                exit_code = cli_module._run(
-                    "gear3",
-                    [
-                        "--request",
-                        str(request_path),
-                        "--current-answer",
-                        str(answer_path),
-                        "--native",
-                        "claude",
-                        "--model",
-                        "fable",
-                    ],
-                )
-                stdout.flush()
+            adapter = ClaudeAdapter(str(executable))
+            self.assertEqual(adapter.call("# packet", role="r"), "answer text")
+            self.assertIsNone(adapter.effective_model)
 
-            self.assertEqual(exit_code, 0)
-            self.assertEqual(output_bytes.getvalue(), b"complete answer")
-            calls = json.loads(calls_path.read_text(encoding="utf-8"))
-            self.assertEqual(len(calls), 2)
-            for arguments in calls:
-                self.assertEqual(
-                    arguments[arguments.index("--model") + 1],
-                    "fable",
-                )
-                self.assertEqual(
-                    arguments[arguments.index("--output-format") + 1],
-                    "json",
-                )
-            status = stderr.getvalue()
-            self.assertIn("Requested native model selector `fable`", status)
-            self.assertIn(
-                "Verified effective native model: `claude-fable-5`", status
-            )
-            record = next((fixture / "runs").glob("*/RUN.md"))
-            record_text = record.read_text(encoding="utf-8")
-            self.assertIn("Requested native model selector: `fable`", record_text)
-            self.assertIn("reported effective model `claude-sonnet-4-5`", record_text)
-            self.assertIn(
-                "Returned effective native model: `claude-fable-5`", record_text
-            )
 
-        class NotReady:
-            def run(self, arguments, *, body: str = "", timeout: float = 60):
+class BridgeAdapterTests(unittest.TestCase):
+    def test_lenient_response_reading_and_choices(self) -> None:
+        packet = "# exact packet"
+
+        class FakeBridgeCommand:
+            def __init__(self, session: Path) -> None:
+                self.session = session
+                self.bodies: list[str] = []
+                self.arguments: list[tuple[str, ...]] = []
+
+            def run(self, arguments, *, body: str = "", timeout: float | None = 60):
+                self.bodies.append(body)
+                self.arguments.append(tuple(arguments))
+                messages = self.session / "messages"
+                messages.mkdir(parents=True, exist_ok=True)
+                response = messages / "0002-peer-to-initiator.md"
+                response.write_text(
+                    "# Message 0002\nFrom: zcode\nTo: ora-gear-3\n"
+                    "An unrecognized header line\n"
+                    "Model: glm-5.3\nEffort: high\n\n"
+                    "## Body\n\n" + _review("SETTLED"),
+                    encoding="utf-8",
+                )
                 return _ProcessResult(
-                    1,
-                    b"",
-                    b"ZCode is not signed in. Next action: Run zcode login.",
+                    0, (str(response) + "\n").encode("utf-8"), b"warning text"
                 )
 
-        with patch("ora_review.adapters._BridgeCommand.locate", return_value=NotReady()):
-            with self.assertRaisesRegex(CallFailure, "ZCode is not signed in") as raised:
-                BridgeAdapter.prepare(peer="zcode", initiator="ora-gear-3")
-            self.assertIn("Run zcode login", raised.exception.display())
+        with tempfile.TemporaryDirectory() as root:
+            session = Path(root) / "session"
+            command = FakeBridgeCommand(session)
+            bridge = BridgeAdapter(command, peer="zcode", session_dir=session)
+            response = bridge.call(packet, role="gear-3-review-1")
+            self.assertEqual(response, _review("SETTLED"))
+            self.assertEqual(command.bodies, [packet])
+            self.assertEqual(
+                command.arguments, [("run", "--session", str(session))]
+            )
+            self.assertEqual(bridge.last_call_notice, "warning text")
+            self.assertIsNotNone(bridge.last_call_choices)
+            self.assertEqual(bridge.last_call_choices.model, "glm-5.3")
+            self.assertEqual(bridge.last_call_choices.effort, "high")
 
-        for verdict, raise_after_response in (("PASS", False), ("FAIL", False), ("FAIL", True)):
-            with self.subTest(
-                verdict=verdict, raise_after_response=raise_after_response
-            ), tempfile.TemporaryDirectory() as root:
-                session = Path(root) / "session"
-                command = FakeBridgeCommand(
-                    session, fail_after_response=True,
-                    raise_after_response=raise_after_response, verdict=verdict
-                )
-                bridge = BridgeAdapter(
-                    command, peer="zcode", initiator="ora-gear-3", session_dir=session
-                )
-                script = {} if verdict == "PASS" else {
-                    "gear-3-revision-1": [lambda p: _answer(p, "revised", revision=True)],
-                    "gear-3-review-2": [_review("PASS")],
-                }
-                native = ScriptedAdapter(script)
-                result = ReviewRunner(native, bridge).run_gear3(
-                    RunRequest(
-                        material=UserMaterial("request"),
-                        existing_answer="answer",
-                        consensus=verdict == "FAIL",
-                        run_root=Path(root) / "runs",
-                    )
-                )
-                self.assertEqual(result.answer, "answer" if verdict == "PASS" else "revised")
-                self.assertEqual(result.status, "PASSED")
-                self.assertTrue(result.technical_incomplete)
-                self.assertEqual(result.exit_code, 1)
-                self.assertEqual(len(command.bodies), 1)
-                self.assertEqual(
-                    [role for role, _ in native.calls],
-                    [] if verdict == "PASS" else ["gear-3-revision-1", "gear-3-review-2"],
-                )
-                run_text = Path(result.run_path).read_text(encoding="utf-8")
-                self.assertIn(_review(verdict), run_text)
-                self.assertIn("transport failure", run_text)
-                if raise_after_response:
-                    detail = (
-                        "`bridge` run ended with a transport failure. "
-                        "Last error output: published response was not flushed"
-                    )
-                    self.assertIn(detail, run_text)
-                    self.assertTrue(any(detail in notice for notice in result.notices))
-                self.assertTrue(any(
-                    "Remaining peer-owned roles will use fresh internal" in notice
-                    for notice in result.notices
-                ))
+    def test_failure_and_foreign_path_are_refused(self) -> None:
+        class FailingCommand:
+            def run(self, arguments, *, body: str = "", timeout: float | None = 60):
+                if "run" in arguments:
+                    return _ProcessResult(1, b"", b"transport broke")
+                return _ProcessResult(0, b"ready\n", b"")
 
+        class OutsideCommand:
+            def run(self, arguments, *, body: str = "", timeout: float | None = 60):
+                if "run" in arguments:
+                    return _ProcessResult(0, b"/etc/passwd\n", b"")
+                raise AssertionError(arguments)
+
+        with tempfile.TemporaryDirectory() as root:
+            session = Path(root) / "session"
+            failing = BridgeAdapter(
+                FailingCommand(), peer="zcode", session_dir=session
+            )
+            with self.assertRaisesRegex(CallFailure, "transport broke"):
+                failing.call("# packet", role="r")
+            outside = BridgeAdapter(
+                OutsideCommand(), peer="zcode", session_dir=session
+            )
+            with self.assertRaisesRegex(CallFailure, "outside its session"):
+                outside.call("# packet", role="r")
+
+
+class ProcessBoundaryTests(unittest.TestCase):
+    def test_cancellation_cleans_up_the_child_group(self) -> None:
         with tempfile.TemporaryDirectory() as root:
             fixture = Path(root)
             request_path = fixture / "request.md"
@@ -1608,7 +1045,9 @@ class AcceptanceTests(unittest.TestCase):
                 stdout, stderr = process.communicate(timeout=15)
                 self.assertEqual(process.returncode, 128 + signal.SIGTERM, stderr)
                 self.assertEqual(stdout, b"")
-                self.assertEqual(calls.read_text(encoding="utf-8").splitlines(), [first_call])
+                self.assertEqual(
+                    calls.read_text(encoding="utf-8").splitlines(), [first_call]
+                )
                 with self.assertRaises(ProcessLookupError):
                     os.kill(int(pid), 0)
                 self.assertFalse(Path(native_directory).exists())
@@ -1622,977 +1061,6 @@ class AcceptanceTests(unittest.TestCase):
                             os.killpg(int(call.split("\t")[0]), signal.SIGKILL)
                         except ProcessLookupError:
                             pass
-
-
-class ParticipantAndTransportContractTests(unittest.TestCase):
-    """The six-engine analytical boundary, no-deadline transport, and Bridge binding."""
-
-    def test_analytical_calls_carry_no_elapsed_deadline(self) -> None:
-        self.assertFalse(
-            hasattr(adapters_module, "MODEL_TIMEOUT_SECONDS"),
-            "an elapsed-time model-call cutoff still exists",
-        )
-        with tempfile.TemporaryDirectory() as root:
-            session = Path(root) / "session"
-            command = FakeBridgeCommand(session)
-            bridge = BridgeAdapter(
-                command, peer="zcode", initiator="ora-gear-3", session_dir=session
-            )
-            self.assertEqual(bridge.engine, "zcode")
-            bridge.call("# packet", role="gear-3-review-1")
-            self.assertEqual(command.arguments, [("run", "--session", str(session))])
-
-    def test_codex_model_and_effort_selection_and_reporting(self) -> None:
-        def write_fake_codex(
-            fixture: Path, *, reported_model: str, reported_effort: str
-        ) -> Path:
-            argv_path = fixture / "codex-argv.json"
-            executable = fixture / "codex"
-            executable.write_text(
-                f"#!{sys.executable}\n"
-                "import json, sys\n"
-                "from pathlib import Path\n"
-                f"Path({str(argv_path)!r}).write_text("
-                "json.dumps(sys.argv[1:]), encoding='utf-8')\n"
-                "sys.stderr.write(\n"
-                "    'OpenAI Codex v0.162.1\\n'\n"
-                "    '--------\\n'\n"
-                "    'workdir: /tmp\\n'\n"
-                f"    'model: {reported_model}\\n'\n"
-                "    'provider: openai\\n'\n"
-                "    'approval: never\\n'\n"
-                "    'sandbox: read-only\\n'\n"
-                f"    'reasoning effort: {reported_effort}\\n'\n"
-                "    'reasoning summaries: none\\n'\n"
-                "    '--------\\n'\n"
-                ")\n"
-                "out = sys.argv[sys.argv.index('--output-last-message') + 1]\n"
-                f"Path(out).write_text({_review('PASS')!r}, encoding='utf-8')\n",
-                encoding="utf-8",
-            )
-            executable.chmod(0o700)
-            return executable
-
-        for named in (True, False):
-            with self.subTest(named=named), tempfile.TemporaryDirectory() as root:
-                fixture = Path(root)
-                request_path = fixture / "request.md"
-                request_path.write_text("Exact request.", encoding="utf-8")
-                answer_path = fixture / "answer.md"
-                answer_path.write_text("complete answer", encoding="utf-8")
-                executable = write_fake_codex(
-                    fixture,
-                    reported_model="gpt-5.3" if named else "gpt-5.1-codex",
-                    reported_effort="high" if named else "medium",
-                )
-                output_bytes = io.BytesIO()
-                stdout = io.TextIOWrapper(output_bytes, encoding="utf-8")
-                stderr = io.StringIO()
-                arguments = [
-                    "--request",
-                    str(request_path),
-                    "--current-answer",
-                    str(answer_path),
-                ]
-                if named:
-                    arguments.extend(
-                        ("--codex-model", "gpt-5.3", "--codex-effort", "high")
-                    )
-                with (
-                    patch.object(
-                        cli_module,
-                        "CodexAdapter",
-                        side_effect=lambda **kwargs: CodexAdapter(
-                            str(executable), **kwargs
-                        ),
-                    ),
-                    patch.object(
-                        cli_module,
-                        "RunRequest",
-                        side_effect=lambda **kwargs: RunRequest(
-                            run_root=fixture / "runs", **kwargs
-                        ),
-                    ),
-                    patch.object(cli_module.sys, "stdout", stdout),
-                    patch.object(cli_module.sys, "stderr", stderr),
-                ):
-                    exit_code = cli_module._run("gear3", arguments)
-                    stdout.flush()
-
-                self.assertEqual(exit_code, 0)
-                self.assertEqual(output_bytes.getvalue(), b"complete answer")
-                codex_arguments = json.loads(
-                    (fixture / "codex-argv.json").read_text(encoding="utf-8")
-                )
-                status = stderr.getvalue()
-                record = next((fixture / "runs").glob("*/RUN.md"))
-                record_text = record.read_text(encoding="utf-8")
-                self.assertIn("Native engine: `codex`", record_text)
-                self.assertIn(
-                    "the model and reasoning effort Codex reports using are recorded.",
-                    status,
-                )
-                if named:
-                    self.assertEqual(
-                        codex_arguments[codex_arguments.index("-m") + 1],
-                        "gpt-5.3",
-                    )
-                    self.assertEqual(
-                        codex_arguments[codex_arguments.index("-c") + 1],
-                        "model_reasoning_effort=high",
-                    )
-                    self.assertIn(
-                        "Requested Codex model `gpt-5.3` and reasoning effort `high`.",
-                        status,
-                    )
-                    self.assertIn(
-                        "Requested native model selector: `gpt-5.3`", record_text
-                    )
-                    self.assertIn(
-                        "Requested native reasoning effort: `high`", record_text
-                    )
-                    self.assertIn("Reported model: `gpt-5.3`", record_text)
-                    self.assertIn("Reported reasoning effort: `high`", record_text)
-                else:
-                    self.assertNotIn("-m", codex_arguments)
-                    self.assertNotIn("-c", codex_arguments)
-                    self.assertIn(
-                        "No Codex model or reasoning effort was requested", status
-                    )
-                    self.assertNotIn("Requested native model selector", record_text)
-                    self.assertNotIn(
-                        "Requested native reasoning effort", record_text
-                    )
-                    self.assertIn("Reported model: `gpt-5.1-codex`", record_text)
-                    self.assertIn("Reported reasoning effort: `medium`", record_text)
-
-        class CodexChoicesBridgeCommand:
-            """A fake Bridge whose codex replies carry the choices lines."""
-
-            def __init__(self, session: Path) -> None:
-                self.session = session
-                self.bodies: list[str] = []
-                self.arguments: list[tuple[str, ...]] = []
-
-            def run(self, arguments, *, body: str = "", timeout: float = 60):
-                self.bodies.append(body)
-                self.arguments.append(tuple(arguments))
-                messages = self.session / "messages"
-                messages.mkdir(parents=True, exist_ok=True)
-                existing = [
-                    int(path.name.split("-", 1)[0])
-                    for path in messages.glob("*-peer-to-initiator.md")
-                    if path.name.split("-", 1)[0].isdigit()
-                ]
-                sequence = max(existing, default=0) + 2
-                header = "\n".join(
-                    (
-                        f"# Message {sequence:04d}",
-                        "From: codex",
-                        "To: ora-gear-3",
-                        "Model: gpt-5.3",
-                        "Effort: high",
-                        "Requested-Model: gpt-5.3",
-                        "Requested-Effort: high",
-                    )
-                )
-                response = messages / f"{sequence:04d}-peer-to-initiator.md"
-                response.write_text(
-                    f"{header}\n\n## Body\n\n" + _review("PASS"), encoding="utf-8"
-                )
-                return _ProcessResult(
-                    0, (str(response) + "\n").encode("utf-8"), b""
-                )
-
-        with tempfile.TemporaryDirectory() as root:
-            fixture = Path(root)
-            session = fixture / "session"
-            command = CodexChoicesBridgeCommand(session)
-            bridge = BridgeAdapter(
-                command,
-                peer="codex",
-                initiator="ora-gear-3",
-                session_dir=session,
-                model="gpt-5.3",
-                effort="high",
-            )
-            native = ScriptedAdapter({})
-            result = ReviewRunner(native, bridge).run_gear3(
-                RunRequest(
-                    material=UserMaterial("request"),
-                    existing_answer="answer",
-                    run_root=fixture / "runs",
-                )
-            )
-            self.assertEqual(result.status, "PASSED")
-            self.assertEqual(result.answer, "answer")
-            self.assertEqual(native.calls, [])
-            self.assertEqual(
-                command.arguments,
-                [
-                    (
-                        "run",
-                        "--session",
-                        str(session),
-                        "--model",
-                        "gpt-5.3",
-                        "--effort",
-                        "high",
-                    )
-                ],
-            )
-            run_text = Path(result.run_path).read_text(encoding="utf-8")
-            self.assertIn(_review("PASS"), run_text)
-            self.assertIn("Peer engine: `codex`", run_text)
-            self.assertIn("Reported model: `gpt-5.3`", run_text)
-            self.assertIn("Reported reasoning effort: `high`", run_text)
-            self.assertIn("Requested model: `gpt-5.3`", run_text)
-            self.assertIn("Requested reasoning effort: `high`", run_text)
-
-    def test_selected_bridge_home_is_bound_and_reported(self) -> None:
-        def make_bridge(root: Path, version: str) -> None:
-            package = root / "ora_agent_bridge"
-            package.mkdir(parents=True)
-            (package / "__main__.py").write_text("", encoding="utf-8")
-            (package / "cli.py").write_text("", encoding="utf-8")
-            (package / "__init__.py").write_text(
-                f'VERSION = "{version}"\n', encoding="utf-8"
-            )
-
-        with tempfile.TemporaryDirectory() as root:
-            fixture = Path(root)
-            selected = fixture / "selected-bridge"
-            make_bridge(selected, "9.9.9")
-            home = fixture / "home"
-            home.mkdir()
-            make_bridge(home / "agent-bridge", "1.0.0")
-            without_selection = os.environ.copy()
-            without_selection.pop("AGENT_BRIDGE_HOME", None)
-
-            with (
-                patch.dict(os.environ, {"AGENT_BRIDGE_HOME": str(selected)}),
-                patch.object(Path, "home", return_value=home),
-            ):
-                command = _BridgeCommand.locate()
-            self.assertEqual(command.root, selected.resolve())
-            self.assertEqual(command.version, "9.9.9")
-            self.assertIn(str(selected.resolve()), command.describe())
-            self.assertIn("9.9.9", command.describe())
-
-            with (
-                patch.dict(
-                    os.environ, {"AGENT_BRIDGE_HOME": str(fixture / "missing-bridge")}
-                ),
-                patch.object(Path, "home", return_value=home),
-            ):
-                with self.assertRaises(CallFailure) as raised:
-                    _BridgeCommand.locate()
-            detail = raised.exception.display()
-            self.assertIn("missing-bridge", detail)
-            self.assertIn("No fallback", detail)
-
-            with (
-                patch.dict(os.environ, without_selection, clear=True),
-                patch.object(Path, "home", return_value=home),
-            ):
-                command = _BridgeCommand.locate()
-            self.assertEqual(command.root, (home / "agent-bridge").resolve())
-            self.assertEqual(command.version, "1.0.0")
-
-    def test_bridge_native_engine_preserves_the_selected_participant(self) -> None:
-        with tempfile.TemporaryDirectory() as root:
-            fixture = Path(root)
-            request_path = fixture / "request.md"
-            request_path.write_text("Exact request.", encoding="utf-8")
-            answer_path = fixture / "answer.md"
-            answer_path.write_text("complete answer", encoding="utf-8")
-            selected = ScriptedAdapter(
-                {"gear-3-review-1": [_review("PASS")]}, engine="zcode"
-            )
-            readiness = (
-                "zcode is ready.\nAgent Bridge copy used: /fake/agent-bridge (1.2.0)"
-            )
-            output_bytes = io.BytesIO()
-            stdout = io.TextIOWrapper(output_bytes, encoding="utf-8")
-            stderr = io.StringIO()
-            with (
-                patch.object(
-                    cli_module,
-                    "CodexAdapter",
-                    side_effect=AssertionError("Codex replaced the selected engine"),
-                ),
-                patch.object(
-                    cli_module.BridgeAdapter, "prepare", return_value=(selected, readiness)
-                ),
-                patch.object(
-                    cli_module,
-                    "RunRequest",
-                    side_effect=lambda **kwargs: RunRequest(
-                        run_root=fixture / "runs", **kwargs
-                    ),
-                ),
-                patch.object(cli_module.sys, "stdout", stdout),
-                patch.object(cli_module.sys, "stderr", stderr),
-            ):
-                exit_code = cli_module._run(
-                    "gear3",
-                    [
-                        "--request",
-                        str(request_path),
-                        "--current-answer",
-                        str(answer_path),
-                        "--native",
-                        "zcode",
-                    ],
-                )
-                stdout.flush()
-
-            self.assertEqual(exit_code, 0)
-            self.assertEqual(output_bytes.getvalue(), b"complete answer")
-            status = stderr.getvalue()
-            self.assertIn("native engine `zcode`", status)
-            self.assertIn("Agent Bridge copy used", status)
-            self.assertIn("fresh Agent Bridge calls to `zcode`", status)
-            self.assertIn(
-                "Effective model and effort are not selected or reported.", status
-            )
-            record = next((fixture / "runs").glob("*/RUN.md"))
-            self.assertIn(
-                "Native engine: `zcode`", record.read_text(encoding="utf-8")
-            )
-
-    def test_unavailable_native_engine_is_never_silently_substituted(self) -> None:
-        with tempfile.TemporaryDirectory() as root:
-            fixture = Path(root)
-            request_path = fixture / "request.md"
-            request_path.write_text("Exact request.", encoding="utf-8")
-            output_bytes = io.BytesIO()
-            stdout = io.TextIOWrapper(output_bytes, encoding="utf-8")
-            stderr = io.StringIO()
-
-            def unavailable(**_kwargs):
-                raise CallFailure("ZCode is not signed in.", "Run zcode login.")
-
-            with (
-                patch.object(
-                    cli_module,
-                    "CodexAdapter",
-                    side_effect=AssertionError("Codex replaced the selected engine"),
-                ),
-                patch.object(
-                    cli_module,
-                    "ClaudeAdapter",
-                    side_effect=AssertionError("Claude replaced the selected engine"),
-                ),
-                patch.object(cli_module.BridgeAdapter, "prepare", side_effect=unavailable),
-                patch.object(cli_module.sys, "stdout", stdout),
-                patch.object(cli_module.sys, "stderr", stderr),
-            ):
-                exit_code = cli_module._run(
-                    "gear3", ["--request", str(request_path), "--native", "zcode"]
-                )
-                stdout.flush()
-
-            self.assertEqual(exit_code, 1)
-            self.assertEqual(output_bytes.getvalue(), b"")
-            status = stderr.getvalue()
-            self.assertIn("Selected native engine `zcode` is unavailable", status)
-            self.assertIn("Run zcode login", status)
-            self.assertIn("No other engine was substituted", status)
-            self.assertIn(
-                "Selectable engines: codex, claude, zcode, hermes, qwen, minimax",
-                status,
-            )
-
-    def test_component_facts_name_roles_and_bridge_requirements(self) -> None:
-        self.assertEqual(
-            ANALYTICAL_ENGINES,
-            ("codex", "claude", "zcode", "hermes", "qwen", "minimax"),
-        )
-        self.assertEqual(COMPONENT_FACTS["component"], "ora-adversarial-review")
-        self.assertEqual(COMPONENT_FACTS["version"], VERSION)
-        self.assertEqual(COMPONENT_FACTS["analytical_roles"]["primary"], ANALYTICAL_ENGINES)
-        self.assertEqual(COMPONENT_FACTS["analytical_roles"]["peer"], ANALYTICAL_ENGINES)
-        self.assertEqual(
-            COMPONENT_FACTS["native_adapter_engines"], ("codex", "claude")
-        )
-        self.assertEqual(
-            COMPONENT_FACTS["bridge_transport"],
-            {"format": 2, "actions": ("check", "record", "run")},
-        )
-
-# ── ORA-92 launch-context prefix (Run B rebuild) ────────────────────────────
-# One prefix/loader mechanism: every packet of a run carries the resolved core
-# first when a global instruction master is configured, the exact current-turn
-# body when supplied, then the repository's rules; the binding is resolved once
-# per run and expires with it.
-
-TEST_CORE = (
-    "CORE — applies to every call this core is sent to.\n\n"
-    "C0 Who may change the core\n- Only the user may authorize an override."
-)
-TEST_OVERRIDE = (
-    "Override C5 for this turn only: answer directly without manufactured "
-    "pushback; applies while the draft stays under review."
-)
-
-# Every runner launch resolves the global instruction master through the real
-# chain: this module points ORA_INSTRUCTION_MASTER at a fixture master file,
-# so no test depends on (or writes into) anything outside its own fixtures.
-_MASTER_FIXTURE: dict[str, object] = {}
-_PRIOR_MASTER_ENV: dict[str, str] = {}
-
-
-def _write_master_file(path: Path, core: str) -> None:
-    path.write_text(
-        f"<!-- ORA-CORE-BEGIN -->\n{core}\n<!-- ORA-CORE-END -->\n",
-        encoding="utf-8",
-    )
-
-
-def setUpModule() -> None:
-    directory = Path(tempfile.mkdtemp(prefix="ora-master-fixture-"))
-    master = directory / "global-instructions.md"
-    _write_master_file(master, TEST_CORE)
-    _MASTER_FIXTURE["directory"] = directory
-    _MASTER_FIXTURE["master"] = master
-    if "ORA_INSTRUCTION_MASTER" in os.environ:
-        _PRIOR_MASTER_ENV["ORA_INSTRUCTION_MASTER"] = os.environ[
-            "ORA_INSTRUCTION_MASTER"
-        ]
-    os.environ["ORA_INSTRUCTION_MASTER"] = str(master)
-
-
-def tearDownModule() -> None:
-    if "ORA_INSTRUCTION_MASTER" in _PRIOR_MASTER_ENV:
-        os.environ["ORA_INSTRUCTION_MASTER"] = _PRIOR_MASTER_ENV[
-            "ORA_INSTRUCTION_MASTER"
-        ]
-    else:
-        os.environ.pop("ORA_INSTRUCTION_MASTER", None)
-    shutil.rmtree(str(_MASTER_FIXTURE["directory"]), ignore_errors=True)
-
-
-def _turn_body(packet: str) -> str:
-    """Extract the current-turn body exactly as forwarded (no normalization)."""
-    heading = "## CURRENT USER INSTRUCTIONS — THIS TURN (VERBATIM)"
-    end = "## END CURRENT USER INSTRUCTIONS"
-    raw = packet[packet.index(heading) + len(heading):packet.index(end)]
-    assert raw.startswith("\n\n"), raw[:20]
-    assert raw.endswith("\n\n"), raw[-20:]
-    return raw[2:-2]
-
-
-class LaunchContextTests(unittest.TestCase):
-    """The per-run prefix mechanism over the shared recording adapters."""
-
-    def _material(self) -> UserMaterial:
-        return UserMaterial(
-            original="Review this exact answer.",
-            later_user_messages=(TEST_OVERRIDE,),
-        )
-
-    def _repo(self, root: Path) -> Path:
-        repo = root / "repo"
-        (repo / "nested").mkdir(parents=True)
-        (repo / "AGENTS.md").write_text(
-            "# AGENTS.md\n\nRule: one file per change.\n\n@extra-rules.md\n",
-            encoding="utf-8",
-        )
-        (repo / "extra-rules.md").write_text(
-            "Imported rule: run the named checks.", encoding="utf-8"
-        )
-        (repo / "nested" / "AGENTS.md").write_text(
-            "Nested rule: keep the diff minimal.", encoding="utf-8"
-        )
-        return repo
-
-    def test_prefix_core_turn_repository_in_every_packet(self) -> None:
-        # Native, peer review and revision packets all carry the same bound
-        # prefix: core first, exact current-turn body, repository rules with
-        # imports expanded and the assigned path's narrower rules.
-        native = ScriptedAdapter({
-            "gear-3-initial-answer": [lambda p: _answer(p, "first answer")],
-            "gear-3-review-1": [_review("FAIL")],
-            "gear-3-revision-1": [
-                lambda p: _answer(p, "revised answer", revision=True)],
-        })
-        peer = ScriptedAdapter({"gear-3-review-1": [_review("FAIL")]})
-        runner = ReviewRunner(native=native, peer=peer)
-        with tempfile.TemporaryDirectory() as root:
-            result = runner.run_gear3(RunRequest(
-                material=self._material(),
-                current_turn_instructions=TEST_OVERRIDE,
-                repository_path=self._repo(Path(root)),
-                assigned_paths=("nested/AGENTS.md",),
-                run_root=Path(root) / "runs",
-            ))
-        self.assertNotEqual(result.status, "PASSED")
-        calls = native.calls + peer.calls
-        self.assertGreaterEqual(len(calls), 3)
-        for role, packet in calls:
-            self.assertLess(
-                packet.index("## CORE RULES — UNIVERSAL"),
-                packet.index("## UNIVERSAL LAWS"), role)
-            self.assertEqual(packet.count(TEST_CORE), 1, role)
-            self.assertEqual(_turn_body(packet), TEST_OVERRIDE, role)
-            self.assertIn("Rule: one file per change.", packet, role)
-            self.assertIn("Imported rule: run the named checks.", packet, role)
-            self.assertIn("NARROWER RULES — nested/AGENTS.md", packet, role)
-            self.assertLess(
-                packet.index("## CURRENT USER INSTRUCTIONS"),
-                packet.index("# SUPPLIED MATERIAL"), role)
-
-    def test_recovery_packet_carries_the_same_body(self) -> None:
-        # The fresh recovery call after a transport failure reuses the
-        # run's bound prefix unchanged.
-        native = ScriptedAdapter({
-            "gear-3-initial-answer": [
-                CallFailure("native engine unavailable"),
-                lambda p: _answer(p, "recovered answer")],
-            "gear-3-review-1": [_review("PASS")],
-        })
-        runner = ReviewRunner(native=native)
-        with tempfile.TemporaryDirectory() as root:
-            result = runner.run_gear3(RunRequest(
-                material=self._material(),
-                current_turn_instructions=TEST_OVERRIDE,
-                run_root=Path(root) / "runs",
-            ))
-        self.assertEqual(result.status, "PASSED")
-        self.assertEqual(len(native.calls), 3)
-        for role, packet in native.calls:
-            self.assertEqual(_turn_body(packet), TEST_OVERRIDE, role)
-
-    def test_binding_expires_with_the_run(self) -> None:
-        native = ScriptedAdapter({
-            "gear-3-initial-answer": [
-                lambda p: _answer(p, "answer one"),
-                lambda p: _answer(p, "answer two"),
-            ],
-            "gear-3-review-1": [_review("PASS"), _review("PASS")],
-        })
-        runner = ReviewRunner(native=native)
-        with tempfile.TemporaryDirectory() as root:
-            runs = Path(root)
-            runner.run_gear3(RunRequest(
-                material=self._material(),
-                current_turn_instructions=TEST_OVERRIDE,
-                run_root=runs / "runs"))
-            self.assertIsNone(runner.packet_builder.instruction_prefix)
-            # A later run without the field never reissues the old override
-            # as current instructions, even with the earlier message
-            # supplied as history; the core still leads.
-            native.calls.clear()
-            runner.run_gear3(RunRequest(
-                material=self._material(), run_root=runs / "runs2"))
-            for role, packet in native.calls:
-                self.assertNotIn("## CURRENT USER INSTRUCTIONS", packet, role)
-                self.assertIn(TEST_CORE, packet, role)
-            # A run that fails inside the graph also clears the binding.
-            with self.assertRaises(OraReviewError):
-                runner.run_gear3(RunRequest(
-                    material=UserMaterial(original=""),
-                    run_root=runs / "runs3"))
-            self.assertIsNone(runner.packet_builder.instruction_prefix)
-
-    def test_reused_runner_resolves_launch_instructions_per_run(self) -> None:
-        # Real resolution per launch: swapping the env-selected master between
-        # runs changes the core the second run carries; a broken selected
-        # master fails the launch before any call and clears the binding.
-        with tempfile.TemporaryDirectory() as root:
-            runs = Path(root)
-            master_one = runs / "master-one.md"
-            master_two = runs / "master-two.md"
-            _write_master_file(master_one, TEST_CORE)
-            _write_master_file(master_two, "CORE v2 — refreshed per launch.")
-            native = ScriptedAdapter({
-                "gear-3-initial-answer": [
-                    lambda p: _answer(p, "a"), lambda p: _answer(p, "b")],
-                "gear-3-review-1": [_review("PASS"), _review("PASS")],
-            })
-            runner = ReviewRunner(native=native)
-            with patch.dict(os.environ, {"ORA_INSTRUCTION_MASTER": str(master_one)}):
-                runner.run_gear3(RunRequest(
-                    material=UserMaterial(original="m"), run_root=runs / "r1"))
-                self.assertIn(TEST_CORE, native.calls[0][1])
-                native.calls.clear()
-                with patch.dict(
-                    os.environ, {"ORA_INSTRUCTION_MASTER": str(master_two)}
-                ):
-                    runner.run_gear3(RunRequest(
-                        material=UserMaterial(original="m"), run_root=runs / "r2"))
-                self.assertIn("CORE v2 — refreshed per launch.",
-                              native.calls[0][1])
-                self.assertNotIn(TEST_CORE, native.calls[0][1])
-            with patch.dict(
-                os.environ, {"ORA_INSTRUCTION_MASTER": str(runs / "missing.md")}
-            ):
-                with self.assertRaises(OraReviewError):
-                    runner.run_gear3(RunRequest(
-                        material=UserMaterial(original="m"),
-                        run_root=runs / "r3"))
-            self.assertIsNone(runner.packet_builder.instruction_prefix)
-
-    def test_global_master_resolution_chain(self) -> None:
-        # The real resolver chain, exercised against fixture files: an
-        # env-selected valid master loads its core and names itself in the
-        # record; a broken selected master fails closed before any call; the
-        # provisioned default path loads; an unconfigured launch proceeds
-        # without the core and discloses that.
-        def environment_without_master() -> dict[str, str]:
-            environment = dict(os.environ)
-            environment.pop("ORA_INSTRUCTION_MASTER", None)
-            return environment
-
-        with tempfile.TemporaryDirectory() as root:
-            root_path = Path(root)
-            master = root_path / "master.md"
-            _write_master_file(master, TEST_CORE)
-
-            def request(run_name: str, **kwargs) -> RunRequest:
-                return RunRequest(
-                    material=UserMaterial(original="m"),
-                    run_root=root_path / run_name, **kwargs)
-
-            # (a) env-selected valid master: the core loads, the packet leads
-            # with it, and the record carries the whole prefix verbatim with
-            # its provenance and digest.
-            native = ScriptedAdapter({
-                "gear-3-initial-answer": [lambda p: _answer(p, "core loads")],
-                "gear-3-review-1": [_review("PASS")],
-            })
-            runner = ReviewRunner(native=native)
-            with patch.dict(os.environ, {"ORA_INSTRUCTION_MASTER": str(master)}):
-                result = runner.run_gear3(request(
-                    "runs-env", current_turn_instructions=TEST_OVERRIDE))
-            self.assertEqual(result.status, "PASSED")
-            self.assertIn(TEST_CORE, native.calls[0][1])
-            packet = native.calls[0][1]
-            prefix = packet.split(
-                "# CONTROLLING ORA INSTRUCTIONS\n\n", 1
-            )[1].split("\n\n## UNIVERSAL LAWS", 1)[0]
-            run_text = Path(result.run_path).read_text(encoding="utf-8")
-            self.assertIn(f"Global instruction master: `{master}`", run_text)
-            self.assertIn("RESOLVED INSTRUCTION PREFIX — VERBATIM", run_text)
-            self.assertIn(f"SHA-256: `{sha256_text(prefix)}`", run_text)
-            self.assertEqual(_turn_body(run_text), TEST_OVERRIDE)
-
-            # (b) env-selected missing master, malformed master, and
-            # invalid-UTF-8 master: hard errors naming the path, before any
-            # adapter call.
-            for name, master_file, fragment, writer in (
-                ("missing", root_path / "missing-master.md", "Cannot read",
-                 None),
-                ("malformed", None, "marker pair",
-                 lambda p: p.write_text("no core markers here",
-                                        encoding="utf-8")),
-                ("invalid-utf8", None, "Cannot read",
-                 lambda p: p.write_bytes(
-                     b"<!-- ORA-CORE-BEGIN -->\n"
-                     b"\xff\xfe invalid utf-8 bytes \xff"
-                     b"<!-- ORA-CORE-END -->\n")),
-            ):
-                with self.subTest(master=name):
-                    if master_file is None:
-                        master_file = root_path / f"{name}-master.md"
-                        writer(master_file)
-                    failing = ScriptedAdapter({})
-                    runner = ReviewRunner(native=failing)
-                    with patch.dict(
-                        os.environ, {"ORA_INSTRUCTION_MASTER": str(master_file)}
-                    ):
-                        with self.assertRaises(OraReviewError) as raised:
-                            runner.run_gear3(request(f"runs-{name}"))
-                    message = str(raised.exception)
-                    self.assertIn(str(master_file), message)
-                    self.assertIn(fragment, message)
-                    self.assertIn("README", message)
-                    # The advice stays portable: apart from the fixture path
-                    # this test supplied, the message carries no absolute
-                    # home path and no machine-specific repair steps, so a
-                    # reintroduced private setup hint fails here.
-                    beyond_fixture = message.replace(str(master_file), "")
-                    self.assertNotIn("/Users/", beyond_fixture)
-                    self.assertNotIn("python3", beyond_fixture)
-                    self.assertNotIn("Regenerate", beyond_fixture)
-                    self.assertEqual(failing.calls, [])
-
-            # (c) the provisioned default path: with no env selection, the
-            # master at ~/.config/ora/global-instructions.md loads.
-            home = root_path / "home-default"
-            (home / ".config" / "ora").mkdir(parents=True)
-            _write_master_file(
-                home / ".config" / "ora" / "global-instructions.md", TEST_CORE)
-            native = ScriptedAdapter({
-                "gear-3-initial-answer": [lambda p: _answer(p, "default path")],
-                "gear-3-review-1": [_review("PASS")],
-            })
-            runner = ReviewRunner(native=native)
-            with (
-                patch.dict(
-                    os.environ, environment_without_master(), clear=True),
-                patch.object(Path, "home", return_value=home),
-            ):
-                result = runner.run_gear3(request("runs-default"))
-            self.assertEqual(result.status, "PASSED")
-            self.assertIn(TEST_CORE, native.calls[0][1])
-            run_text = Path(result.run_path).read_text(encoding="utf-8")
-            self.assertIn(
-                "Global instruction master: "
-                f"`{home / '.config' / 'ora' / 'global-instructions.md'}`",
-                run_text,
-            )
-
-            # (d) unconfigured: the run proceeds without the core, the
-            # disclosure notice surfaces, and the record notes it.
-            empty_home = root_path / "home-empty"
-            empty_home.mkdir()
-            native = ScriptedAdapter({
-                "gear-3-initial-answer": [lambda p: _answer(p, "no core")],
-                "gear-3-review-1": [_review("PASS")],
-            })
-            runner = ReviewRunner(native=native)
-            with (
-                patch.dict(
-                    os.environ, environment_without_master(), clear=True),
-                patch.object(Path, "home", return_value=empty_home),
-            ):
-                result = runner.run_gear3(request("runs-unconfigured"))
-            self.assertEqual(result.status, "PASSED")
-            self.assertIn(NO_MASTER_NOTICE, result.notices)
-            self.assertNotIn("## CORE RULES — UNIVERSAL", native.calls[0][1])
-            run_text = Path(result.run_path).read_text(encoding="utf-8")
-            self.assertIn(NO_MASTER_NOTICE, run_text)
-            self.assertIn("Global instruction master: `none`", run_text)
-            self.assertIn(
-                "No instruction prefix was bound for this run.", run_text)
-
-    def test_default_master_broken_entry_fails_closed(self) -> None:
-        # A directory or a dangling symlink at the documented default path
-        # is broken provisioned configuration, not an unconfigured launch:
-        # both are hard errors naming the path, before any adapter call.
-        environment = dict(os.environ)
-        environment.pop("ORA_INSTRUCTION_MASTER", None)
-
-        with tempfile.TemporaryDirectory() as root:
-            root_path = Path(root)
-
-            def fresh_home(name: str) -> Path:
-                home = root_path / name
-                (home / ".config" / "ora").mkdir(parents=True)
-                return home
-
-            cases = [
-                ("directory", fresh_home("home-dir"),
-                 lambda default: default.mkdir()),
-                ("dangling-symlink", fresh_home("home-link"),
-                 lambda default: default.symlink_to(
-                     root_path / "master-gone.md")),
-            ]
-            for name, home, break_default in cases:
-                with self.subTest(entry=name):
-                    default = home / ".config" / "ora" / "global-instructions.md"
-                    try:
-                        break_default(default)
-                    except (OSError, NotImplementedError) as failure:
-                        self.skipTest(f"entry unavailable: {failure}")
-                    failing = ScriptedAdapter({})
-                    runner = ReviewRunner(native=failing)
-                    with (
-                        patch.dict(os.environ, environment, clear=True),
-                        patch.object(Path, "home", return_value=home),
-                    ):
-                        with self.assertRaises(OraReviewError) as raised:
-                            runner.run_gear3(RunRequest(
-                                material=UserMaterial(original="m"),
-                                run_root=root_path / f"runs-{name}"))
-                    message = str(raised.exception)
-                    self.assertIn(str(default), message)
-                    self.assertIn("README", message)
-                    self.assertEqual(failing.calls, [])
-
-    def test_default_master_unsearchable_parent_fails_closed(self) -> None:
-        # A provisioned default master whose parent directory cannot be
-        # searched is inaccessible configuration, not absence: the launch
-        # stops with the master error naming the path and the README
-        # advice, before any adapter call. A probe that swallows
-        # PermissionError (lexists-style) would mistake this for no
-        # configuration and run without the core rules.
-        environment = dict(os.environ)
-        environment.pop("ORA_INSTRUCTION_MASTER", None)
-
-        with tempfile.TemporaryDirectory() as root:
-            root_path = Path(root)
-            home = root_path / "home-lock"
-            ora_dir = home / ".config" / "ora"
-            ora_dir.mkdir(parents=True)
-            default = ora_dir / "global-instructions.md"
-            _write_master_file(default, TEST_CORE)
-            try:
-                ora_dir.chmod(0o000)
-            except (OSError, NotImplementedError) as failure:
-                self.skipTest(f"permission state unavailable: {failure}")
-            try:
-                try:
-                    os.lstat(default)
-                except PermissionError:
-                    pass
-                else:
-                    self.skipTest(
-                        "the unsearchable-parent state did not take effect "
-                        "(root or platform ignores directory permissions)")
-                failing = ScriptedAdapter({})
-                runner = ReviewRunner(native=failing)
-                with (
-                    patch.dict(os.environ, environment, clear=True),
-                    patch.object(Path, "home", return_value=home),
-                ):
-                    with self.assertRaises(OraReviewError) as raised:
-                        runner.run_gear3(RunRequest(
-                            material=UserMaterial(original="m"),
-                            run_root=root_path / "runs-locked"))
-                message = str(raised.exception)
-                self.assertIn(str(default), message)
-                self.assertIn("README", message)
-                # The advice stays portable here too: beyond the fixture
-                # path, no absolute home path or machine-specific hint.
-                beyond_fixture = message.replace(str(default), "")
-                self.assertNotIn("/Users/", beyond_fixture)
-                self.assertEqual(failing.calls, [])
-            finally:
-                ora_dir.chmod(0o755)
-
-    def test_cli_reports_invalid_utf8_master_without_traceback(self) -> None:
-        # A master file with invalid UTF-8 reaches the user as the required
-        # message naming the path — never an unhandled traceback — and no
-        # adapter call happens.
-        with tempfile.TemporaryDirectory() as root:
-            root_path = Path(root)
-            bad_master = root_path / "bad-encoding-master.md"
-            bad_master.write_bytes(
-                b"<!-- ORA-CORE-BEGIN -->\n"
-                b"\xff\xfe invalid utf-8 bytes \xff"
-                b"<!-- ORA-CORE-END -->\n")
-            request_path = root_path / "request.md"
-            request_path.write_text(
-                "Review this exact answer.", encoding="utf-8")
-            calls: list[tuple[str, str]] = []
-
-            class RecordingCodex:
-                engine = "codex"
-
-                def call(self, packet: str, *, role: str) -> str:
-                    calls.append((role, packet))
-                    raise AssertionError("no adapter call may happen")
-
-            stdout = io.StringIO()
-            stderr = io.StringIO()
-            with (
-                patch.dict(
-                    os.environ,
-                    {"ORA_INSTRUCTION_MASTER": str(bad_master)}),
-                patch.object(cli_module, "CodexAdapter",
-                             return_value=RecordingCodex()),
-                patch.object(cli_module.sys, "stdout", stdout),
-                patch.object(cli_module.sys, "stderr", stderr),
-            ):
-                exit_code = cli_module._run("gear3", [
-                    "--request", str(request_path), "--native", "codex"])
-            self.assertEqual(exit_code, 1)
-            self.assertEqual(calls, [])
-            message = stderr.getvalue()
-            self.assertIn(str(bad_master), message)
-            self.assertIn("README", message)
-            self.assertNotIn("Traceback", message)
-
-    def test_loader_refusals_happen_before_any_call(self) -> None:
-        native = ScriptedAdapter({})
-        runner = ReviewRunner(native=native)
-        with tempfile.TemporaryDirectory() as root:
-            root_path = Path(root)
-            repo = self._repo(root_path)
-            outside = root_path / "outside.txt"
-            outside.write_text("outside", encoding="utf-8")
-            cycle = root_path / "cycle"
-            cycle.mkdir()
-            (cycle / "AGENTS.md").write_text(
-                "@loop.md\nCycle rules.", encoding="utf-8")
-            (cycle / "loop.md").write_text(
-                "@AGENTS.md\nLoop rules.", encoding="utf-8")
-            material = UserMaterial(original="m")
-            cases = {
-                "missing repository": {"repository_path": root_path / "nope"},
-                "assigned path outside the repository": {
-                    "repository_path": repo,
-                    "assigned_paths": (str(outside),)},
-                "blank assigned path": {
-                    "repository_path": repo, "assigned_paths": ("  ",)},
-                "assigned paths without a repository": {
-                    "assigned_paths": ("nested/AGENTS.md",)},
-                "cyclic instruction imports": {"repository_path": cycle},
-            }
-            for name, kwargs in cases.items():
-                with self.subTest(name):
-                    with self.assertRaises(OraReviewError):
-                        runner.run_gear3(RunRequest(
-                            material=material, run_root=root_path / "runs",
-                            **kwargs))
-        self.assertEqual(native.calls, [])
-
-    def test_cli_file_inputs_construct_the_request_only(self) -> None:
-        with tempfile.TemporaryDirectory() as root:
-            root_path = Path(root)
-            request = root_path / "request.txt"
-            request.write_text("Review this exact answer.", encoding="utf-8")
-            turn = root_path / "turn.txt"
-            turn.write_text(TEST_OVERRIDE, encoding="utf-8")
-            repo = self._repo(root_path)
-            captured: list[str] = []
-
-            class RecordingCodex:
-                engine = "codex"
-
-                def call(self, packet: str, *, role: str) -> str:
-                    captured.append(packet)
-                    if "review" in role:
-                        return _review("PASS")
-                    return _answer(packet, "cli answer")
-
-            with (
-                patch.object(cli_module, "CodexAdapter",
-                             return_value=RecordingCodex()),
-                patch.object(
-                    cli_module,
-                    "RunRequest",
-                    side_effect=lambda **kwargs: RunRequest(
-                        run_root=root_path / "runs", **kwargs
-                    ),
-                ),
-            ):
-                exit_code = cli_module._run("gear3", [
-                    "--request", str(request),
-                    "--turn-instructions-file", str(turn),
-                    "--repository", str(repo),
-                    "--assigned-path", "nested/AGENTS.md",
-                    "--native", "codex",
-                ])
-            self.assertEqual(exit_code, 0)
-            # The CLI run wrote its record inside the fixture, never under the
-            # real run-record root, and the RUN.md records the governing
-            # instruction prefix with the turn body verbatim inside it.
-            records = tuple((root_path / "runs").glob("*/RUN.md"))
-            self.assertEqual(len(records), 1)
-            run_text = records[0].read_text(encoding="utf-8")
-            self.assertIn("RESOLVED INSTRUCTION PREFIX — VERBATIM", run_text)
-            self.assertEqual(_turn_body(run_text), TEST_OVERRIDE)
-        self.assertTrue(captured)
-        for packet in captured:
-            self.assertIn("## CORE RULES — UNIVERSAL", packet)
-            self.assertEqual(_turn_body(packet), TEST_OVERRIDE)
-            self.assertIn("Rule: one file per change.", packet)
-            self.assertIn("NARROWER RULES — nested/AGENTS.md", packet)
-
 
 
 if __name__ == "__main__":

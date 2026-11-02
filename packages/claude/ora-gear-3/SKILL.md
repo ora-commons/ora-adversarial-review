@@ -10,28 +10,22 @@ reviser, recovery, or recording logic here.
 
 Invoke it only when the exact original request is available in a caller-supplied
 local file or through standard input supplied directly by the caller. Never
-reconstruct, tidy, summarize, or retype chat text and call that “verbatim.” If
+reconstruct, tidy, summarize, or retype chat text and call that "verbatim." If
 no exact machine-readable source exists, explain that limitation.
 
-- One-pass is the default; add `--consensus` only when the user asks.
 - Supply `--native claude` for the compatible Claude default. Pass the caller's
   explicit engine choice through unchanged — `--native codex`, or
   `--native zcode`/`hermes`/`qwen`/`minimax` for a fresh analytical route through
   Agent Bridge. Add `--model fable` or `--model claude-fable-5` only when the
   caller selects that Claude Fable model; otherwise let the CLI use its
   configured model, and never choose or switch an engine or model silently. The
-  command verifies and records the exact effective model for every successful
-  native role.
+  command records the exact effective model for every successful native role.
 - Add `--peer TARGET` only for the exact Agent Bridge target the user selected.
   Bridge is optional and owns target validation; do not discover or substitute.
 - Add `--repository PATH` with the absolute path of the repository or task
   worktree the request works on — the real candidate worktree, not the
   document folder, primary checkout, or temporary launch directory. Omit it
   for non-repository work; never guess a repository from the request text.
-- Add `--assigned-path PATH` once per path the assignment actually works on
-  inside that repository — repository-relative or absolute, taken from the
-  assignment itself, never guessed from request text. Omit it for
-  whole-repository work.
 - Add `--turn-instructions-file FILE` when the current user message carries
   instructions for this turn — for example an override naming a core rule
   with its condition and scope. The file must hold the exact original
